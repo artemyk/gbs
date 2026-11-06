@@ -110,3 +110,98 @@ def test_observed_query_ridge_with_an_mps_teacher():
             dimension=1, queries_per_head=2, hidden=None, decoder_method='observed'), progress=None)
     assert result.decoder.queries.device.type == 'mps'
     assert np.isfinite(result.diagnostics['validation_mse'])
+
+
+def test_cluster_centers_are_per_head_and_handle_duplicate_native_queries():
+    from gbs.decoder import _cluster_queries
+    # Every head has its own two exact native query vectors, with fewer distinct
+    # vectors than requested clusters. Means must retain the raw head scale.
+    pool = torch.tensor([[[[0., 0.], [0., 0.], [4., 2.], [4., 2.]],
+                          [[20., -4.], [20., -4.], [24., -2.], [24., -2.]]]], dtype=torch.float64)
+    centers, diagnostics = _cluster_queries(pool, 3, np.random.default_rng(2))
+    repeated, _ = _cluster_queries(pool, 3, np.random.default_rng(2))
+    torch.testing.assert_close(centers, repeated, atol=0, rtol=0)
+    for head in range(2):
+        distance = (pool[0, head, :, None]-centers[0, head]).square().sum(-1)
+        assert distance.min(1).values.max() == 0
+        assert diagnostics[head]['mean_squared_distance'] == 0
+        assert sum(diagnostics[head]['counts']) == 4
+        assert diagnostics[head]['converged']
+    assert centers[0, 1, :, 0].min() >= 20
+
+
+def test_query_initialization_changes_only_trainable_queries_and_preserves_prefix_data():
+    torch.manual_seed(7)
+    adapter = BeliefStateAdapter(Transformer(Config(vocab=2, bos_visible=True)).double())
+    parents = words(2, 5)
+    target = lambda h: h.double().sum(1, keepdim=True)
+    results = {}
+    for initialization in ['random', 'observed', 'clustered']:
+        result = fit_decoder(adapter, parents[:20], parents[20:], target,
+            config=DecoderConfig(dimension=1, queries_per_head=3, hidden=4,
+                decoder_query_init=initialization, decoder_query_samples=32,
+                decoder_steps=0), progress=None)
+        assert result.decoder.queries.requires_grad
+        assert not result.training.cached_features
+        results[initialization] = result
+    reference = results['random']
+    initial_net = {name: value.clone() for name, value in reference.decoder.net.state_dict().items()}
+    for initialization, result in results.items():
+        for name, value in initial_net.items():
+            torch.testing.assert_close(value, result.decoder.net.state_dict()[name], atol=0, rtol=0)
+        for n, (states, targets) in reference.training.groups.items():
+            x, y = result.training.groups[n]
+            torch.testing.assert_close(x, states, atol=0, rtol=0)
+            torch.testing.assert_close(y, targets, atol=0, rtol=0)
+        # A real optimizer update must move the queries, for every initialization.
+        before = result.decoder.queries.detach().clone()
+        x, y = result.training.groups[5]
+        optimizer = torch.optim.Adam(result.decoder.parameters(), lr=.01)
+        (result.decoder(adapter, x)-y).square().mean().backward(); optimizer.step()
+        assert not torch.equal(before, result.decoder.queries)
+    observed = results['observed']
+    for sample in observed.diagnostics['query_samples']:
+        n, row, slot = sample['length'], sample['parent_row'], sample['slot']
+        expected = adapter.observed_queries(adapter.history_state(parents[row:row+1, :n]))[0]
+        initial = torch.tensor(observed.diagnostics['query_initialization']['queries'], dtype=expected.dtype)[:, :, slot]
+        torch.testing.assert_close(initial, expected, atol=1e-12, rtol=1e-12)
+    assert results['observed'].diagnostics['query_initialization']['pool_samples'] == results['clustered'].diagnostics['query_initialization']['pool_samples']
+
+
+@pytest.mark.parametrize('fields', [dict(decoder_query_init='other'),
+    dict(decoder_method='observed', decoder_query_init='clustered'),
+    dict(decoder_query_init='clustered', decoder_query_samples=1)])
+def test_invalid_query_initialization_is_rejected(fields):
+    from gbs.decoder import validate_decoder_config
+    with pytest.raises(ValueError, match='decoder_query'):
+        validate_decoder_config(DecoderConfig(**fields))
+
+
+def test_observed_initialization_collects_large_pools_in_bounded_batches():
+    class CountingAdapter(BeliefStateAdapter):
+        def __init__(self, model):
+            super().__init__(model)
+            self.query_batches = []
+        def observed_queries(self, states):
+            self.query_batches.append(len(states))
+            return super().observed_queries(states)
+    adapter = CountingAdapter(Transformer(Config(vocab=2)))
+    parents = words(2, 4)
+    fit_decoder(adapter, parents[:8], parents[8:], lambda h: h.float().sum(1, keepdim=True),
+        config=DecoderConfig(dimension=1, queries_per_head=2, hidden=4, decoder_steps=0,
+            decoder_query_init='observed', decoder_query_samples=513,
+            decoder_min_length=3, decoder_max_length=3), progress=None)
+    assert adapter.query_batches == [256, 256, 1]
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason='MPS hardware required')
+@pytest.mark.parametrize('initialization', ['observed', 'clustered'])
+def test_trainable_native_query_initialization_with_an_mps_teacher(initialization):
+    adapter = BeliefStateAdapter(Transformer(Config(vocab=2, bos_visible=True))).to('mps')
+    parents = words(2, 4)
+    result = fit_decoder(adapter, parents[:8], parents[8:], lambda h: h.float().sum(1, keepdim=True),
+        config=DecoderConfig(dimension=1, queries_per_head=2, hidden=4, decoder_steps=1,
+            decoder_query_init=initialization, decoder_query_samples=16), progress=None)
+    assert result.decoder.queries.device.type == 'mps'
+    assert result.decoder.queries.requires_grad
+    assert np.isfinite(result.diagnostics['validation_mse'])

@@ -25,6 +25,8 @@ class DecoderConfig:
     seed: int = 0
     allow_shared_histories: bool = False
     decoder_method: str = "learned"
+    decoder_query_init: str = "random"
+    decoder_query_samples: int = 4096
     decoder_min_length: int = 0
     decoder_max_length: int | None = None
     decoder_samples: int | None = None
@@ -35,6 +37,13 @@ class DecoderConfig:
 def validate_decoder_config(config):
     if config.decoder_method not in ["learned", "observed"]:
         raise ValueError("decoder_method must be learned or observed")
+    if config.decoder_query_init not in ["random", "observed", "clustered"]:
+        raise ValueError("decoder_query_init must be random, observed, or clustered")
+    if config.decoder_method != "learned" and config.decoder_query_init != "random":
+        raise ValueError("decoder_query_init applies to learned decoders")
+    if config.decoder_query_samples < 1 or (config.decoder_query_init != "random" and
+            config.decoder_query_samples < config.queries_per_head):
+        raise ValueError("decoder_query_samples must be at least queries_per_head")
     if (config.decoder_min_length < 0 or
             (config.decoder_max_length is not None and config.decoder_max_length < config.decoder_min_length)):
         raise ValueError("Invalid decoder prefix-length range")
@@ -114,13 +123,56 @@ def _observed_bank(adapter, sequences, rows, queries_per_head, rng):
         if not len(slots):
             continue
         ids = rng.choice(allowed[n], size=len(slots), replace=True)
-        histories = sequences[torch.tensor(ids, device=sequences.device), :n]
-        native = adapter.observed_queries(adapter.history_state(histories.to(adapter.device)))
-        if native.shape != (len(ids), adapter.n_layers, adapter.n_heads, adapter.head_dim):
-            raise ValueError("observed_queries returned an incompatible shape")
-        bank[:, :, torch.tensor(slots, device=bank.device)] = native.permute(1, 2, 0, 3)
+        for left in range(0, len(ids), 256):
+            selected = ids[left:left+256]
+            histories = sequences[torch.tensor(selected, device=sequences.device), :n]
+            native = adapter.observed_queries(adapter.history_state(histories.to(adapter.device)))
+            if native.shape != (len(selected), adapter.n_layers, adapter.n_heads, adapter.head_dim):
+                raise ValueError("observed_queries returned an incompatible shape")
+            bank[:, :, torch.tensor(slots[left:left+256], device=bank.device)] = native.permute(1, 2, 0, 3)
         sampled.extend(dict(slot=int(slot), length=n, parent_row=int(parent)) for slot, parent in zip(slots, ids))
     return bank, sorted(sampled, key=lambda x: x['slot'])
+
+
+@torch.no_grad()
+def _cluster_queries(pool, count, rng, *, max_iterations=100, tolerance=1e-5):
+    """Raw Euclidean k-means++ independently per layer/head, in CPU float64.
+
+    One seeded start is used. Empty clusters retain their previous center; this
+    permits repeated centers when the teacher supplies fewer distinct queries
+    than requested. Query norms are not normalized. Convergence uses relative
+    Frobenius displacement, with an absolute floor of one on the reference norm.
+    """
+    source = pool.detach().cpu().double().numpy()
+    centers = np.empty((*source.shape[:2], count, source.shape[-1]))
+    diagnostics = []
+    for layer in range(source.shape[0]):
+        for head in range(source.shape[1]):
+            x = source[layer, head]
+            c = np.empty((count, x.shape[1]))
+            c[0] = x[rng.integers(len(x))]
+            nearest = np.square(x-c[0]).sum(1)
+            for k in range(1, count):
+                total = nearest.sum()
+                selected = rng.choice(len(x), p=nearest/total) if total > 0 else rng.integers(len(x))
+                c[k] = x[selected]
+                nearest = np.minimum(nearest, np.square(x-c[k]).sum(1))
+            for iteration in range(1, max_iterations+1):
+                distances = np.square(x[:, None]-c).sum(2)
+                labels = distances.argmin(1)
+                updated = np.stack([x[labels == k].mean(0) if np.any(labels == k) else c[k]
+                                    for k in range(count)])
+                converged = np.linalg.norm(updated-c) <= tolerance*max(1., np.linalg.norm(c))
+                c = updated
+                if converged:
+                    break
+            distances = np.square(x[:, None]-c).sum(2)
+            labels = distances.argmin(1)
+            centers[layer, head] = c
+            diagnostics.append(dict(layer=layer, head=head, iterations=iteration,
+                converged=bool(converged), mean_squared_distance=float(distances.min(1).mean()),
+                counts=np.bincount(labels, minlength=count).tolist()))
+    return torch.as_tensor(centers, device=pool.device, dtype=pool.dtype), diagnostics
 
 
 @torch.no_grad()
@@ -190,10 +242,13 @@ def fit_decoder(adapter, train_sequences, validation_sequences, coordinates, *, 
 
     Split parent sequences before prefix expansion. Short prefixes may coincide
     across splits; they are not separate held-out histories. ``coordinates`` must
-    use the same basis, center, and whitening at every length. Observed queries
-    are sampled only from training prefixes, before positional rotation, and stay
-    fixed. With hidden=None their readout is fitted by ridge regression; otherwise
-    only the MLP is trained on cached features. Learned queries use raw states.
+    use the same basis, center, and whitening at every length. The observed
+    decoder method samples training-prefix queries before positional rotation
+    and freezes them. With hidden=None its readout is fitted by ridge regression;
+    otherwise only the MLP is trained on cached features. Learned queries use raw states and
+    can start from random queries, a sampled observed pool, or its per-head cluster
+    centers. Observed and clustered starts share the same training-only pool;
+    clustering never normalizes query magnitudes or depends on decoding length.
     """
     config = config or DecoderConfig()
     validate_decoder_config(config)
@@ -219,10 +274,29 @@ def fit_decoder(adapter, train_sequences, validation_sequences, coordinates, *, 
                               np.random.default_rng(config.seed+22), validation=True)
     cached = config.decoder_method == 'observed'
     sampled = []
+    initialization_started = time.perf_counter()
+    initialization = dict(method="observed" if cached else config.decoder_query_init)
     if cached:
         queries, sampled = _observed_bank(adapter, train_sequences, rows, config.queries_per_head,
                                            np.random.default_rng(config.seed+21))
-        decoder.queries.copy_(queries)
+    elif config.decoder_query_init != "random":
+        if progress: progress(f"Collecting {config.decoder_query_samples} observed queries for {config.decoder_query_init} initialization")
+        pool, pool_samples = _observed_bank(adapter, train_sequences, rows, config.decoder_query_samples,
+                                           np.random.default_rng(config.seed+21))
+        initialization['pool_samples'] = pool_samples
+        rng = np.random.default_rng(config.seed+23)
+        if config.decoder_query_init == "observed":
+            selected = rng.choice(pool.shape[2], size=config.queries_per_head, replace=False)
+            queries = pool[:, :, torch.tensor(selected, device=pool.device)]
+            sampled = [dict(pool_samples[int(index)], slot=slot) for slot, index in enumerate(selected)]
+        else:
+            queries, clusters = _cluster_queries(pool, config.queries_per_head, rng)
+            initialization.update(clusters=clusters, max_iterations=100, tolerance=1e-5)
+    if cached or config.decoder_query_init != "random":
+        with torch.no_grad():
+            decoder.queries.copy_(queries)
+    initialization.update(seconds=time.perf_counter()-initialization_started,
+                          queries=decoder.queries.detach().cpu().tolist())
     if progress: progress(f"Preparing decoder prefixes {config.decoder_min_length}..{high}; method={config.decoder_method}")
     training = _prepare(adapter, train_sequences, rows, coordinates, decoder, cached)
     validation = _prepare(adapter, validation_sequences, valid_rows, coordinates, decoder, cached)
@@ -231,7 +305,7 @@ def fit_decoder(adapter, train_sequences, validation_sequences, coordinates, *, 
     if cached and config.hidden is None:
         ridge_scores = _ridge(decoder, adapter, training, validation, config.decoder_ridges)
         score, _ = validation.measure(decoder, adapter)
-        trace.append(dict(stage='decoder', step=0, validation_mse=score))
+        trace.append(dict(stage='decoder', step=0, validation_mse=score, seconds=time.perf_counter()-started))
         if progress: progress(f"decoder ridge: validation MSE {score:.6g}")
     else:
         rng = np.random.default_rng(config.seed)
@@ -240,7 +314,7 @@ def fit_decoder(adapter, train_sequences, validation_sequences, coordinates, *, 
         for step in range(config.decoder_steps+1):
             if step % config.validate_every == 0 or step == config.decoder_steps:
                 score, _ = validation.measure(decoder, adapter)
-                trace.append(dict(stage='decoder', step=step, validation_mse=score))
+                trace.append(dict(stage='decoder', step=step, validation_mse=score, seconds=time.perf_counter()-started))
                 if score < best:
                     best, state = score, copy.deepcopy(decoder.state_dict())
                 if progress: progress(f"decoder {step}/{config.decoder_steps}: validation MSE {score:.6g}")
@@ -256,7 +330,7 @@ def fit_decoder(adapter, train_sequences, validation_sequences, coordinates, *, 
     diagnostics = dict(method=config.decoder_method, lengths=[config.decoder_min_length, high],
         training_rows=sum(len(x) for x, _ in training.groups.values()),
         validation_rows=sum(len(x) for x, _ in validation.groups.values()),
-        query_samples=sampled, ridge_scores=ridge_scores, validation_mse=score,
+        query_samples=sampled, query_initialization=initialization, ridge_scores=ridge_scores, validation_mse=score,
         validation_by_length=by_length, timing_seconds=dict(preparation=prepared-started,
                                                           fitting=time.perf_counter()-prepared,
                                                           total=time.perf_counter()-started))

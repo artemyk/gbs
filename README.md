@@ -204,6 +204,20 @@ The query bank stays fixed during subsequent joint fitting and after reload.
 readout. For decoder-only experiments, `fit_decoder` accepts `DecoderConfig`,
 parent sequences, and a callable giving coordinates in one shared basis.
 
+For trainable queries, set `decoder_query_init` to `"random"` (the default),
+`"observed"`, or `"clustered"`. The latter two collect the same seeded pool of
+`decoder_query_samples` native training queries (default 4096), then either sample
+queries from that pool or use k-means++ centers separately for each layer/head.
+Clustering pools all training lengths in the pre-RoPE frame, uses raw Euclidean
+distance without normalizing query magnitudes, and retains repeated centers when
+there are fewer distinct native queries than requested. Both queries and readout
+are optimized from the first update; attention responses are recomputed as queries
+move. The decoder architecture, prefix distribution, and initial MLP parameters
+are otherwise unchanged. These initialization options apply to
+`decoder_method="learned"`; frozen observed-query fitting retains its sampled bank.
+Validation trace entries include elapsed seconds from the start of fitting,
+including query initialization and cache preparation.
+
 1. **Fit a GHMM.** Query the teacher's joint probabilities of short futures.
    Center their vectors, retain the leading singular directions, and fit one
    observable operator per token by least squares on joint successor vectors.
