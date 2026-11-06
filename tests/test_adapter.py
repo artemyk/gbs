@@ -188,3 +188,21 @@ def test_cached_natural_targets_preserve_loss_and_encoder_gradients(adapter):
         encode_bank(adapter, decoder, bank)
     with pytest.raises(ValueError, match="frozen decoder"):
         abstraction_loss(model, cached)
+
+
+def test_observed_queries_match_native_projection_before_rope(adapter):
+    tokens = torch.randint(adapter.vocab_size, (3, 12))
+    native = []
+    handles = [block.qkv.register_forward_hook(
+        lambda module, inputs, output: native.append(output.detach().clone()))
+        for block in adapter.model.blocks]
+    adapter.model(tokens)
+    for handle in handles:
+        handle.remove()
+    for n in [0, 1, 5, 11]:
+        queries = adapter.observed_queries(adapter.history_state(tokens[:, :n]))
+        expected = torch.stack([value.reshape(3, 12, 3, adapter.n_heads, adapter.head_dim)
+                                [:, n, 0] for value in native], 1)
+        torch.testing.assert_close(queries, expected, atol=1e-10, rtol=1e-10)
+        if adapter.rope and n:
+            assert not torch.allclose(queries, rotary(queries, n))

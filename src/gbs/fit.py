@@ -14,33 +14,24 @@ from torch import Tensor
 
 from .adapters import CacheModel
 from .ghmm import GHMM, fit_ghmm
-from .models import Architecture, AttentionDecoder, AffineEncoder, GBSAbstraction
+from .models import AffineEncoder, GBSAbstraction
+from .decoder import DecoderConfig, fit_decoder, validate_decoder_config
 from .data import DEFAULT_EVALUATION_SEED, DataBank, EncodedBank, check_history_pair, encode_bank, make_bank, prepare_histories
 
 
 @dataclass
-class FitConfig:
-    dimension: int = 4
-    queries_per_head: int = 4
-    hidden: int = 64
+class FitConfig(DecoderConfig):
     horizon: int = 16
     future_length: int = 4
     spectral_samples: int = 512
-    decoder_steps: int = 5000
     encoder_steps: int = 2000
     joint_steps: int = 4000
-    batch_size: int = 64
-    decoder_lr: float = 1e-3
-    decoder_min_lr_fraction: float = 1.0
     joint_decoder_lr: float = 1e-4
     encoder_lr: float = 3e-4
     tracking_weight: float = .1
     coordinate_weight: float = .1
     roundtrip_weight: float = .1
-    validate_every: int = 200
-    seed: int = 0
     max_outcomes: int = 65536
-    allow_shared_histories: bool = False
     teacher_every: int = 1
 
 
@@ -80,8 +71,8 @@ def _validate_config(config):
         raise ValueError("teacher_every must be a positive integer")
     if config.teacher_every > 1 and config.roundtrip_weight + config.tracking_weight == 0:
         raise ValueError("Alternating updates require a positive round-trip or tracking weight")
-    if isinstance(config, FitConfig) and not 0 < config.decoder_min_lr_fraction <= 1:
-        raise ValueError("decoder_min_lr_fraction must be in (0, 1]")
+    if isinstance(config, FitConfig):
+        validate_decoder_config(config)
     for key, value in asdict(config).items():
         if (key.endswith("_steps") or key == "steps") and value < 0:
             raise ValueError("Training steps cannot be negative")
@@ -208,28 +199,17 @@ def fit_abstraction(adapter: CacheModel, train_histories: Tensor, validation_his
     if progress: progress("Preparing natural caches and fixed teacher continuation banks")
     train = make_bank(adapter, train_histories, config.horizon, seed=config.seed+10, anchors=train_target)
     valid = make_bank(adapter, validation_histories, config.horizon, seed=config.seed+11, anchors=validation_target)
-    train_states, validation_states = train.states, valid.states
-    architecture = Architecture(config.dimension, config.queries_per_head, config.hidden)
-    decoder = AttentionDecoder(adapter, architecture)
-    optimizer = torch.optim.Adam(decoder.parameters(), lr=config.decoder_lr)
-    trace, best, best_state = [], float("inf"), None
-    for step in range(config.decoder_steps+1):
-        if step % config.validate_every == 0 or step == config.decoder_steps:
-            with torch.no_grad():
-                score = float((decoder(adapter, validation_states)-validation_target).square().mean())
-            trace.append(dict(stage="decoder", step=step, validation_mse=score))
-            if score < best: best, best_state = score, copy.deepcopy(decoder.state_dict())
-            if progress: progress(f"decoder {step}/{config.decoder_steps}: validation MSE {score:.6g}")
-        if step == config.decoder_steps: break
-        fraction = config.decoder_min_lr_fraction + (1-config.decoder_min_lr_fraction)*.5*(
-            1+np.cos(np.pi*step/config.decoder_steps))
-        optimizer.param_groups[0]["lr"] = config.decoder_lr*fraction
-        ids = torch.tensor(rng.integers(len(train_states), size=config.batch_size), device=adapter.device)
-        loss = (decoder(adapter, train_states[ids])-train_target[ids]).square().mean()
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        optimizer.step()
-    decoder.load_state_dict(best_state)
+    def coordinates(histories):
+        code = target(histories.to(target_device)).detach().to(device=adapter.device, dtype=adapter.dtype)
+        return (code-center)@whitener
+    train_sequences = torch.cat([train_histories.cpu(), train.tokens.cpu()], 1)
+    validation_sequences = torch.cat([validation_histories.cpu(), valid.tokens.cpu()], 1)
+    decoder_result = fit_decoder(adapter, train_sequences, validation_sequences, coordinates,
+                                 config=config, progress=progress)
+    decoder, architecture = decoder_result.decoder, decoder_result.architecture
+    trace = decoder_result.trace.copy()
+    diagnostics['decoder'] = decoder_result.diagnostics
+    train_states = train.states
     encoder = AffineEncoder.initialize(adapter, train_states, train_target)
     model = GBSAbstraction(adapter, decoder, encoder, architecture)
     for stage, steps in [("encoder", config.encoder_steps), ("joint", config.joint_steps)]:
@@ -243,11 +223,14 @@ def fit_abstraction(adapter: CacheModel, train_histories: Tensor, validation_his
             if step % config.validate_every == 0 or step == steps:
                 with torch.no_grad():
                     totals = [float(abstraction_loss(model, stage_valid.select(slice(left, left+256)),
-                        tracking_weight=config.tracking_weight, coordinate_weight=config.coordinate_weight,
+                        tracking_weight=config.tracking_weight, coordinate_weight=0,
                         roundtrip_weight=config.roundtrip_weight)["total"])*min(256, len(valid.states)-left)
                         for left in range(0, len(valid.states), 256)]
-                score = sum(totals)/len(valid.states)
-                trace.append(dict(stage=stage, step=step, validation_loss=score))
+                coordinate_score, by_length = decoder_result.validation.measure(decoder, adapter)
+                score = sum(totals)/len(valid.states)+config.coordinate_weight*coordinate_score
+                trace.append(dict(stage=stage, step=step, validation_loss=score,
+                                  validation_coordinate_mse=coordinate_score,
+                                  validation_coordinate_by_length=by_length))
                 if score < best: best, best_state = score, _interface_state(model)
                 if progress: progress(f"{stage} {step}/{steps}: validation loss {score:.6g}")
             if step == steps: break
@@ -259,7 +242,11 @@ def fit_abstraction(adapter: CacheModel, train_histories: Tensor, validation_his
                 loss, _ = _encoder_loss(model, stage_train.select(ids), config, step, steps)
             else:
                 loss = abstraction_loss(model, stage_train.select(ids), tracking_weight=config.tracking_weight,
-                    coordinate_weight=config.coordinate_weight, roundtrip_weight=config.roundtrip_weight)["total"]
+                    coordinate_weight=0, roundtrip_weight=config.roundtrip_weight)["total"]
+                if config.coordinate_weight:
+                    x, y = decoder_result.training.sample(rng, config.batch_size)
+                    predicted = decoder_result.training.prediction(decoder, adapter, x)
+                    loss = loss+config.coordinate_weight*(predicted-y).square().mean()
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_([*encoder.parameters(), *decoder.parameters()], 1., error_if_nonfinite=True)

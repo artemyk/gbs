@@ -14,20 +14,27 @@ from .adapters import CacheModel
 class Architecture:
     dimension: int = 4
     queries_per_head: int = 4
-    hidden: int = 64
+    hidden: int | None = 64
+    learn_queries: bool = True
 
 
 class AttentionDecoder(nn.Module):
     def __init__(self, adapter: CacheModel, architecture: Architecture):
         super().__init__()
         a = architecture
-        if min(a.dimension, a.queries_per_head, a.hidden) < 1:
+        self.dimension = a.dimension
+        if min(a.dimension, a.queries_per_head) < 1 or (a.hidden is not None and a.hidden < 1):
             raise ValueError("Decoder dimensions must be positive")
-        self.queries = nn.Parameter(torch.randn(adapter.n_layers, adapter.n_heads, a.queries_per_head, adapter.head_dim,
-                                                device=adapter.device, dtype=adapter.dtype))
+        queries = torch.randn(adapter.n_layers, adapter.n_heads, a.queries_per_head, adapter.head_dim,
+                              device=adapter.device, dtype=adapter.dtype)
+        if a.learn_queries:
+            self.queries = nn.Parameter(queries)
+        else:
+            self.register_buffer("queries", queries)
         inputs = adapter.token_features + adapter.n_layers*adapter.n_heads*a.queries_per_head*adapter.head_dim
-        self.net = nn.Sequential(nn.Linear(inputs, a.hidden), nn.Tanh(), nn.Linear(a.hidden, a.dimension)).to(
-            device=adapter.device, dtype=adapter.dtype)
+        self.net = (nn.Linear(inputs, a.dimension) if a.hidden is None else
+                    nn.Sequential(nn.Linear(inputs, a.hidden), nn.Tanh(), nn.Linear(a.hidden, a.dimension)))
+        self.net.to(device=adapter.device, dtype=adapter.dtype)
 
     def forward(self, adapter, states):
         return self.net(adapter.features(states, self.queries))

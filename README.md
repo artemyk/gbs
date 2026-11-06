@@ -183,16 +183,37 @@ rate. Its default of 1 keeps the learning rate constant. For example,
 `queries_per_head`, `hidden`, and `decoder_steps` control decoder capacity and
 training budget. Decoder checkpoints are selected by validation coordinate MSE.
 
+Decoder pretraining samples prefixes from length 0 through root length plus
+`horizon` by default. Each training parent contributes one uniformly sampled
+length; `decoder_samples` changes the total number of samples. Validation uses
+up to `decoder_validation_samples` parent rows at **every** length. A minibatch
+contains one length, avoiding attention padding. Set `decoder_min_length` and
+`decoder_max_length` to restrict the range. The encoder still writes a fixed
+representative root length. One set of decoder queries and one readout are
+shared across all lengths, with a single train-derived coordinate transform.
+Split parent histories first; short prefixes may coincide across splits.
+
+Set `decoder_method="observed"` to sample queries from natural training
+prefixes and freeze them. For RoPE, queries are collected **before** positional
+rotation; the adapter rotates this same bank at the length being decoded.
+Attention responses are cached once. `hidden=None` fits a linear readout by
+ridge regression, selecting its penalty on validation data;
+`hidden=128`, for example, trains only a tanh MLP on the cached features.
+The query bank stays fixed during subsequent joint fitting and after reload.
+`decoder_method="learned"` remains the default and optimizes both queries and
+readout. For decoder-only experiments, `fit_decoder` accepts `DecoderConfig`,
+parent sequences, and a callable giving coordinates in one shared basis.
+
 1. **Fit a GHMM.** Query the teacher's joint probabilities of short futures.
    Center their vectors, retain the leading singular directions, and fit one
    observable operator per token by least squares on joint successor vectors.
    An explicit constant coordinate enforces normalization. A four-dimensional
    abstraction starts with a five-dimensional GHMM. Its initial state is
    obtained from a separate empty-history query.
-2. **Fit the decoder.** Whiten GHMM coordinates using training histories and
-   regress them from attention measurements of natural transformer states.
-   The decoder learns queries for every layer and head. It reads normalized
-   attention responses and current-token coordinates, followed by a tanh MLP.
+2. **Fit the decoder.** Whiten GHMM coordinates using training roots and reuse
+   that transform at every prefix length. Regress these coordinates from
+   normalized attention responses and current-token coordinates. Queries can
+   be learned jointly with the readout, or sampled from the teacher and frozen.
 3. **Initialize and fit the encoder.** An affine map writes a representative
    cache and relaxed token. Initialize it by least squares against natural
    states, then fit with the decoder fixed.
@@ -217,14 +238,17 @@ $$
 Tracking compares the decoded written trajectory to the decoded natural
 trajectory, including the root and all successors; natural targets are detached
 from gradients. The coordinate term anchors natural states to the initial
-whitened GHMM coordinates. The explicit root term measures `D(E(z)) - z` with
+whitened GHMM coordinates across the decoder's training-prefix distribution,
+including during joint fitting. The explicit root term measures `D(E(z)) - z` with
 the target `z` detached. Default weights are 0.1 for each auxiliary term.
 The frozen teacher receives no parameter updates; gradients flow through its
 operations into written states. Configuration dataclasses expose dimensions,
 optimization steps, learning rates, loss weights, seeds, and validation cadence.
 
-Natural caches are constructed once in batches of at most 256 roots and reused
-for decoder regression, encoder initialization, and the continuation banks.
+Natural root caches are constructed in batches of at most 256 roots and reused
+for encoder initialization and the continuation banks. Decoder pretraining
+separately prepares its sampled prefixes, retaining raw states for learned
+queries or cached attention features for frozen observed queries.
 Training and evaluation share the per-root rollout calculations; their mean
 versus summed KL conventions remain distinct.
 
@@ -304,6 +328,10 @@ another architecture, implement:
 
 Generic implementations supply sampling, sequential rollouts, future queries,
 and checkpoint fingerprints. A vectorized `trajectory` override is optional.
+The observed-query shortcut additionally requires `observed_queries(states)`,
+returning native next-token queries with shape `(batch, layers, heads, head_dim)`
+in the frame before positional rotation. Learned-query fitting does not require
+this method.
 Keep the teacher in evaluation mode, with gradients disabled on its parameters.
 This is an adapter interface, not an automatic loader for arbitrary transformer
 libraries.
@@ -342,6 +370,9 @@ sequential continuation gradients, attention measurements, BOS and position
 handling, affine-writer constraints, checkpoint matching, and spectral recovery
 of an analytic three-symbol process. An end-to-end fit checks default GHMM
 initialization, split isolation, artifact reload, and frozen-decoder refinement.
+Additional tests check native pre-RoPE query capture, prefix-length coverage,
+frozen query banks across joint fitting and reload, and ridge regression with
+collinear features.
 Exact enumeration also checks the sequence-KL chain rule for repeated
 compression. CI runs the suite on Python 3.10 and 3.12.
 

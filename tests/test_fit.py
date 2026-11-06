@@ -99,14 +99,14 @@ def test_repeated_compression_kl_matches_exact_joint_kl():
     assert adapter.anchor.grad is None
 
 
-def test_fitting_builds_each_root_cache_once_in_bounded_batches():
+def test_fitting_prepares_root_and_prefix_caches_in_bounded_batches():
     class CountingTeacher(CoinMixture):
         def __init__(self):
             super().__init__()
             self.prepared = []
 
         def history_state(self, history):
-            self.prepared.append(len(history))
+            self.prepared.append((len(history), history.shape[1]))
             return super().history_state(history)
 
     adapter = CountingTeacher()
@@ -115,8 +115,11 @@ def test_fitting_builds_each_root_cache_once_in_bounded_batches():
         initializer=lambda h: h.double().sum(1, keepdim=True), config=FitConfig(
             dimension=1, queries_per_head=1, hidden=4, horizon=2,
             decoder_steps=0, encoder_steps=0, joint_steps=0), progress=None)
-    assert sum(adapter.prepared) == len(histories)
-    assert max(adapter.prepared) <= 256
+    # Root banks, one randomly assigned prefix per training parent, and a
+    # shared 256-parent validation sample at each of lengths 0 through 12.
+    assert sum(count for count, _ in adapter.prepared) == 1024+512+256*13
+    assert max(count for count, _ in adapter.prepared) <= 256
+    assert {length for _, length in adapter.prepared} == set(range(13))
 
 
 def test_loss_and_gradients_match_an_independent_sequential_rollout():

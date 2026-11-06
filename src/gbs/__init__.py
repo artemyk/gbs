@@ -2,8 +2,10 @@
 from .adapters import CacheModel, BeliefStateAdapter
 from .ghmm import GHMM, fit_ghmm
 from .models import Architecture, AttentionDecoder, AffineEncoder, GBSAbstraction
+from .decoder import DecoderConfig, DecoderFitResult, fit_decoder
 from .fit import FitConfig, RefineConfig, FitResult, fit_abstraction, refine_encoder, evaluate
 
 __all__ = ["CacheModel", "BeliefStateAdapter", "GHMM", "fit_ghmm", "Architecture",
            "AttentionDecoder", "AffineEncoder", "GBSAbstraction", "FitConfig", "RefineConfig",
-           "FitResult", "fit_abstraction", "refine_encoder", "evaluate"]
+           "FitResult", "fit_abstraction", "refine_encoder", "evaluate",
+           "DecoderConfig", "DecoderFitResult", "fit_decoder"]
