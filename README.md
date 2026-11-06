@@ -1,5 +1,7 @@
 # Generalized belief states
 
+Method and experiments: [Generalized belief states in transformers](https://www.lesswrong.com/posts/4f9p7brLdnTMFuwfB/generalized-belief-states-in-transformers-1).
+
 Fit a low-dimensional predictive state to a trained, frozen transformer. A
 **decoder** reads the transformer's KV cache and current token into coordinates
 `z`. An **encoder** writes those coordinates into a representative KV cache and
@@ -31,24 +33,44 @@ The supplied adapter supports the transformers in
 four-layer, width-64 RoPE model, trained on MRRXOR with mixing probability 0.05:
 
 ```sh
-git clone https://github.com/artemyk/belief-state.git ../belief-state
-python examples/belief_state.py --belief-state ../belief-state --quick --plot
+python examples/belief_state.py --quick --plot
 ```
 
 This performs a small smoke run and writes `outputs/rope/`. For a full fit,
 omit `--quick` and choose a new output directory:
 
 ```sh
-python examples/belief_state.py --belief-state ../belief-state \
-  --output outputs/rope-full --plot
+python examples/belief_state.py --output outputs/rope-full --plot
 ```
 
-The default checkpoint is `runs/L4_d64_rope/eps0.05/s0.pt`. The demo was checked
-against upstream commit `61c2a5570ce7df8ca5a739b2ecc0a27716cea5c4`.
-Use `--checkpoint` and `--model-source` for another checkpoint and its matching
-`model.py`. Visible-BOS, log-normalizer, and raw numerator/denominator variants
-are supported when the matching source and checkpoint are available. The
-adapter also supports learned positional embeddings and multiple heads.
+The demo downloads only the roughly 0.6 MB
+[checkpoint](https://github.com/artemyk/belief-state/blob/61c2a5570ce7df8ca5a739b2ecc0a27716cea5c4/runs/L4_d64_rope/eps0.05/s0.pt),
+pinned to upstream commit `61c2a5570ce7df8ca5a739b2ecc0a27716cea5c4`, and verifies
+its SHA-256 checksum. It caches the file at
+`checkpoints/L4_d64_rope_eps0.05_s0.pt`; subsequent runs reuse the verified file.
+No source checkout is needed. Use `--checkpoint path/to/model.pt` for a local
+checkpoint. The adapter also supports visible-BOS, log-normalizer, raw
+numerator/denominator, learned-position, and multi-head configurations.
+
+### Checkpoint format
+
+The existing belief-state files already use the usual
+[PyTorch checkpoint pattern](https://docs.pytorch.org/tutorials/beginner/saving_loading_models.html):
+an ordinary dictionary containing a configuration dictionary and a
+model `state_dict`, rather than a pickled model object:
+
+```python
+torch.save({"config": config_dict, "model": model.state_dict()}, "model.pt")
+```
+
+The loader reads `config` and `model`, constructs the supported architecture
+included in this package, and loads weights strictly with
+`torch.load(..., weights_only=True, map_location="cpu")`. Training metadata in
+the checkpoint is ignored. There is no format conversion or remote Python
+source execution. Configurations must specify all trained attention and
+position options; unknown fields and mismatched weights raise errors. This
+loader is specific to the belief-state architecture; other model families use
+their own `CacheModel` adapter. The encoder and fitting code are shared.
 
 The demo samples length-16 MRRXOR histories. Distinct histories are assigned to
 disjoint training, validation, and test sets, retaining each history's sampling
@@ -66,8 +88,8 @@ Outputs include:
   and coordinate transformation, and validation checkpoints;
 - `test_metrics.json`: evaluation on the test histories with independent teacher
   continuations;
-- `histories.pt` and `demo.json`: data splits, seeds, source/checkpoint hashes,
-  source commit, and numerical library versions;
+- `histories.pt` and `demo.json`: data splits, seeds, checkpoint hash and URL,
+  source commit for the pinned demo, model configuration, and library versions;
 - `geometry.png` with `--plot`: projections of decoded states and their encoder
   round trips, colored by the last two tokens.
 
@@ -81,8 +103,7 @@ import torch
 from gbs import BeliefStateAdapter, FitConfig, fit_abstraction, evaluate
 
 teacher = BeliefStateAdapter.from_checkpoint(
-    "../belief-state/runs/L4_d64_rope/eps0.05/s0.pt",
-    model_source="../belief-state/model.py",
+    "checkpoints/L4_d64_rope_eps0.05_s0.pt",
     device="cpu",
 )
 # Supply disjoint integer tensors (number_of_histories, history_length).
@@ -98,7 +119,6 @@ metrics = evaluate(result.abstraction, test, horizon=16, seed=1000)
 Use `GBSAbstraction.load(path, teacher)` to reload an abstraction. The frozen
 teacher is supplied separately; loading checks a hash of its parameters and
 adapter specification. Save methods refuse to overwrite existing artifacts.
-Only load model-source Python files you intend to execute.
 
 The fitted interface can be used directly:
 
@@ -147,10 +167,7 @@ Training averages KL per token and coordinate errors per dimension. The
 objective is
 
 $$
-\mathcal{L} = \tfrac12 (L_{\mathrm{single}} + L_{\mathrm{repeated}})
- + \lambda_{\mathrm{track}} L_{\mathrm{track}}
- + \lambda_{\mathrm{coord}} L_{\mathrm{coord}}
- + \lambda_{\mathrm{rt}} L_{\mathrm{rt}}.
+\mathcal{L} = \frac{1}{2}(L_{\mathrm{single}} + L_{\mathrm{repeated}}) + \lambda_{\mathrm{track}} L_{\mathrm{track}} + \lambda_{\mathrm{coord}} L_{\mathrm{coord}} + \lambda_{\mathrm{rt}} L_{\mathrm{rt}}.
 $$
 
 Tracking compares the decoded written trajectory to the decoded natural
@@ -245,7 +262,7 @@ initialization, split isolation, artifact reload, and frozen-decoder refinement.
 Exact enumeration also checks the sequence-KL chain rule for repeated
 compression. CI runs the suite on Python 3.10 and 3.12.
 
-The transformer adapter follows the architecture in
+The included checkpoint architecture follows
 [belief-state](https://github.com/artemyk/belief-state); the demo uses its MRRXOR
 process. Both repositories are available under the MIT license. This package
 contains fitting code, not the earlier experiment directories or their results.

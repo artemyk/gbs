@@ -2,27 +2,13 @@
 from __future__ import annotations
 
 from dataclasses import asdict
-import hashlib
-import importlib.util
-from pathlib import Path
-import sys
 
 import torch
 from torch import Tensor
 import torch.nn.functional as F
 
 from .base import CacheModel
-
-
-def rotate(x: Tensor, positions) -> Tensor:
-    half = x.shape[-1] // 2
-    if x.shape[-1] % 2:
-        raise ValueError("RoPE requires an even head dimension")
-    freq = 10000.0 ** (-torch.arange(half, device=x.device, dtype=torch.float32) / half)
-    angles = torch.as_tensor(positions, device=x.device)[..., None] * freq
-    cos, sin = angles.cos().to(x.dtype), angles.sin().to(x.dtype)
-    a, b = x[..., :half], x[..., half:]
-    return torch.cat([a*cos-b*sin, a*sin+b*cos], -1)
+from ._belief_state_model import Config, Transformer, rotate
 
 
 class BeliefStateAdapter(CacheModel):
@@ -48,16 +34,18 @@ class BeliefStateAdapter(CacheModel):
             raise ValueError("This adapter currently supports float32 and float64 teachers")
 
     @classmethod
-    def from_checkpoint(cls, checkpoint, model_source, *, device="cpu"):
-        """Load a checkpoint with the matching model.py; no source code is vendored."""
-        source = Path(model_source).resolve()
-        name = "_gbs_teacher_" + hashlib.sha256(source.read_bytes()).hexdigest()[:16]
-        spec = importlib.util.spec_from_file_location(name, source)
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[name] = module
-        spec.loader.exec_module(module)
+    def from_checkpoint(cls, checkpoint, *, device="cpu"):
+        """Load upstream's config + model state dictionary; no source checkout needed.
+
+        The checkpoint contains tensors and ordinary Python data and is loaded
+        with weights_only=True. Unknown model fields or mismatched parameter
+        names/shapes raise errors rather than silently changing the architecture.
+        """
         saved = torch.load(checkpoint, map_location="cpu", weights_only=True)
-        model = module.Transformer(module.Config(**saved["config"]))
+        if not isinstance(saved, dict) or not {"config", "model"} <= saved.keys():
+            raise ValueError("Expected a belief-state checkpoint with config and model state dictionary")
+        model = Transformer(Config(**saved["config"]))
+        model.to(dtype=saved["model"]["embed.weight"].dtype)
         model.load_state_dict(saved["model"])
         return cls(model).to(device)
 
@@ -67,7 +55,9 @@ class BeliefStateAdapter(CacheModel):
         return self
 
     def spec(self):
-        return dict(**super().spec(), layout="kv-token-length-v1", config=asdict(self.model.cfg))
+        config = dict(attention_mass=False, attention_sums=False, bos_visible=False)
+        config.update(asdict(self.model.cfg))
+        return dict(**super().spec(), layout="kv-token-length-v1", config=config)
 
     def _unpack(self, states):
         width = states.shape[1] - self.token_features - 1

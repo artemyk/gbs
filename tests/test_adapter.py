@@ -1,4 +1,5 @@
 import itertools
+from dataclasses import asdict
 
 import pytest
 import torch
@@ -84,3 +85,30 @@ def test_encoder_fixed_coordinates_and_checkpoint_roundtrip(adapter, tmp_path):
     with pytest.raises(FileExistsError): model.save(path)
     with torch.no_grad(): adapter.model.unembed.bias.add_(.01)
     with pytest.raises(ValueError, match="match"): GBSAbstraction.load(path, adapter)
+
+
+def test_checkpoint_load_without_source_preserves_predictions_and_dtype(adapter, tmp_path):
+    path = tmp_path/"teacher.pt"
+    torch.save(dict(config=asdict(adapter.model.cfg), model=adapter.model.state_dict()), path)
+    loaded = BeliefStateAdapter.from_checkpoint(path)
+    assert loaded.dtype == adapter.dtype
+    assert loaded.fingerprint() == adapter.fingerprint()
+    tokens = torch.randint(adapter.vocab_size, (3, adapter.max_history))
+    torch.testing.assert_close(loaded.model(tokens), adapter.model(tokens), atol=1e-10, rtol=1e-10)
+    raw = loaded.history_state(tokens[:, :4])
+    torch.testing.assert_close(loaded.predict(raw), adapter.predict(adapter.history_state(tokens[:, :4])), atol=1e-10, rtol=1e-10)
+
+
+def test_checkpoint_rejects_missing_or_mismatched_architecture(tmp_path):
+    path = tmp_path/"bad.pt"
+    torch.save(dict(weights={}), path)
+    with pytest.raises(ValueError, match="config and model"):
+        BeliefStateAdapter.from_checkpoint(path)
+    model = Transformer(Config())
+    config = asdict(model.cfg)
+    torch.save(dict(config=dict(config, unknown_architecture=True), model=model.state_dict()), path)
+    with pytest.raises(TypeError, match="unknown_architecture"):
+        BeliefStateAdapter.from_checkpoint(path)
+    torch.save(dict(config=dict(config, d_model=32), model=model.state_dict()), path)
+    with pytest.raises(RuntimeError, match="size mismatch"):
+        BeliefStateAdapter.from_checkpoint(path)

@@ -11,13 +11,28 @@ from dataclasses import asdict
 import hashlib
 import json
 from pathlib import Path
-import subprocess
 
 import numpy as np
 import torch
 
 from gbs import (BeliefStateAdapter, FitConfig, GBSAbstraction, RefineConfig,
                  evaluate, fit_abstraction, refine_encoder)
+
+
+DEMO_COMMIT = "61c2a5570ce7df8ca5a739b2ecc0a27716cea5c4"
+DEMO_URL = f"https://raw.githubusercontent.com/artemyk/belief-state/{DEMO_COMMIT}/runs/L4_d64_rope/eps0.05/s0.pt"
+DEMO_SHA256 = "ed2dd66a861de49e7268d4521c8a3e36923b1cd6c215b96f31b99d75515a1ff6"
+
+
+def demo_checkpoint(directory):
+    """Download one pinned checkpoint, validating new and cached files by SHA-256."""
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory/"L4_d64_rope_eps0.05_s0.pt"
+    if not path.exists():
+        torch.hub.download_url_to_file(DEMO_URL, str(path), hash_prefix=DEMO_SHA256, progress=True)
+    if hashlib.sha256(path.read_bytes()).hexdigest() != DEMO_SHA256:
+        raise ValueError(f"Demo checkpoint checksum mismatch: {path}")
+    return path
 
 
 def sample_histories(size, length, epsilon, seed):
@@ -80,9 +95,8 @@ def geometry(model, histories, output):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--belief-state", type=Path, required=True, help="Local artemyk/belief-state checkout")
-    parser.add_argument("--checkpoint", type=Path, help="Defaults to runs/L4_d64_rope/eps0.05/s0.pt")
-    parser.add_argument("--model-source", type=Path, help="Defaults to MODEL_CHECKOUT/model.py; use matching source for variants")
+    parser.add_argument("--checkpoint", type=Path, help="Local belief-state checkpoint; otherwise download the pinned large RoPE model")
+    parser.add_argument("--checkpoint-dir", type=Path, default=Path("checkpoints"), help="Cache directory for the demo checkpoint")
     parser.add_argument("--output", type=Path, default=Path("outputs/rope"))
     parser.add_argument("--device", choices=["cpu", "mps", "cuda"], default="cpu")
     parser.add_argument("--samples", type=int, help="4096 by default; 256 with --quick")
@@ -98,9 +112,8 @@ def main():
     if args.refine_steps < 0:
         parser.error("refine-steps cannot be negative")
     torch.set_num_threads(args.threads)
-    checkpoint = args.checkpoint or args.belief_state/"runs/L4_d64_rope/eps0.05/s0.pt"
-    source = args.model_source or args.belief_state/"model.py"
-    adapter = BeliefStateAdapter.from_checkpoint(checkpoint, model_source=source, device=args.device)
+    checkpoint = args.checkpoint or demo_checkpoint(args.checkpoint_dir)
+    adapter = BeliefStateAdapter.from_checkpoint(checkpoint, device=args.device)
     config = FitConfig(seed=args.seed)
     if args.quick:
         config = FitConfig(seed=args.seed, spectral_samples=128, decoder_steps=200,
@@ -119,11 +132,11 @@ def main():
     with torch.no_grad():
         states = adapter.history_state(test[:8].to(adapter.device))
         torch.testing.assert_close(loaded.decode(states), result.abstraction.decode(states), rtol=0, atol=0)
-    commit = subprocess.run(["git", "-C", str(args.belief_state), "rev-parse", "HEAD"], capture_output=True, text=True)
     metadata = dict(seed=args.seed, epsilon=args.epsilon, device=args.device,
         torch_version=str(torch.__version__), numpy_version=np.__version__,
-        teacher_commit=commit.stdout.strip() if commit.returncode == 0 else None,
-        source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
+        checkpoint_url=DEMO_URL if args.checkpoint is None else None,
+        teacher_commit=DEMO_COMMIT if args.checkpoint is None else None,
+        teacher_config=adapter.spec()["config"], teacher_fingerprint=adapter.fingerprint(),
         checkpoint_sha256=hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
         split_sizes=dict(train=len(train), validation=len(validation), test=len(test)), fit=asdict(config))
     (args.output/"demo.json").write_text(json.dumps(metadata, indent=2)+"\n")
