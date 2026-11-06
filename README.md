@@ -176,6 +176,13 @@ BOS. `advance` implements write, transformer update, then decode.
 
 ## Fitting procedure
 
+Decoder regression uses `FitConfig.decoder_lr`. Set `decoder_min_lr_fraction`
+below 1 to apply cosine decay toward that fraction of the initial learning
+rate. Its default of 1 keeps the learning rate constant. For example,
+`decoder_lr=0.001, decoder_min_lr_fraction=0.01` decays toward 0.00001.
+`queries_per_head`, `hidden`, and `decoder_steps` control decoder capacity and
+training budget. Decoder checkpoints are selected by validation coordinate MSE.
+
 1. **Fit a GHMM.** Query the teacher's joint probabilities of short futures.
    Center their vectors, retain the leading singular directions, and fit one
    observable operator per token by least squares on joint successor vectors.

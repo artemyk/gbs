@@ -243,3 +243,34 @@ def test_encoded_bank_preparation_streams_before_building_the_next_raw_batch():
     assert decoded_after[0] == 64
     assert sum(adapter.prepared) == 512 and max(adapter.prepared) == 64
     assert len(bank.codes) == 512 and not hasattr(bank, "states")
+
+
+@pytest.mark.parametrize("steps, fraction", [(0, .01), (4, .01), (4, 1.)])
+def test_decoder_learning_rate_schedule_reaches_the_optimizer(steps, fraction, monkeypatch):
+    rates = []
+    original = torch.optim.Adam.step
+    def recorded(optimizer, *args, **kwargs):
+        rates.append(float(optimizer.param_groups[0]["lr"]))
+        return original(optimizer, *args, **kwargs)
+    monkeypatch.setattr(torch.optim.Adam, "step", recorded)
+    histories = words(2, 4)
+    result = fit_abstraction(CoinMixture(), histories[::2], histories[1::2],
+        initializer=lambda h: h.double().sum(1, keepdim=True), config=FitConfig(
+            dimension=1, queries_per_head=1, hidden=4, horizon=2,
+            decoder_steps=steps, encoder_steps=0, joint_steps=0,
+            decoder_min_lr_fraction=fraction), progress=None)
+    assert result.config["decoder_min_lr_fraction"] == fraction
+    assert len(rates) == steps
+    if steps:
+        assert rates[0] == result.config["decoder_lr"]
+        if fraction < 1:
+            assert rates[-1] < rates[0]
+            assert all(a >= b for a, b in zip(rates, rates[1:]))
+        else:
+            assert all(rate == rates[0] for rate in rates)
+
+
+@pytest.mark.parametrize("fraction", [0, -.1, 1.1, float("nan")])
+def test_invalid_decoder_learning_rate_fractions_are_rejected(fraction):
+    with pytest.raises(ValueError, match="decoder_min_lr_fraction"):
+        fit_abstraction(None, None, None, config=FitConfig(decoder_min_lr_fraction=fraction), progress=None)

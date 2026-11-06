@@ -31,6 +31,7 @@ class FitConfig:
     joint_steps: int = 4000
     batch_size: int = 64
     decoder_lr: float = 1e-3
+    decoder_min_lr_fraction: float = 1.0
     joint_decoder_lr: float = 1e-4
     encoder_lr: float = 3e-4
     tracking_weight: float = .1
@@ -79,6 +80,8 @@ def _validate_config(config):
         raise ValueError("teacher_every must be a positive integer")
     if config.teacher_every > 1 and config.roundtrip_weight + config.tracking_weight == 0:
         raise ValueError("Alternating updates require a positive round-trip or tracking weight")
+    if isinstance(config, FitConfig) and not 0 < config.decoder_min_lr_fraction <= 1:
+        raise ValueError("decoder_min_lr_fraction must be in (0, 1]")
     for key, value in asdict(config).items():
         if (key.endswith("_steps") or key == "steps") and value < 0:
             raise ValueError("Training steps cannot be negative")
@@ -218,6 +221,9 @@ def fit_abstraction(adapter: CacheModel, train_histories: Tensor, validation_his
             if score < best: best, best_state = score, copy.deepcopy(decoder.state_dict())
             if progress: progress(f"decoder {step}/{config.decoder_steps}: validation MSE {score:.6g}")
         if step == config.decoder_steps: break
+        fraction = config.decoder_min_lr_fraction + (1-config.decoder_min_lr_fraction)*.5*(
+            1+np.cos(np.pi*step/config.decoder_steps))
+        optimizer.param_groups[0]["lr"] = config.decoder_lr*fraction
         ids = torch.tensor(rng.integers(len(train_states), size=config.batch_size), device=adapter.device)
         loss = (decoder(adapter, train_states[ids])-train_target[ids]).square().mean()
         optimizer.zero_grad(set_to_none=True)
