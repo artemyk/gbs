@@ -221,6 +221,12 @@ for decoder regression, encoder initialization, and the continuation banks.
 Training and evaluation share the per-root rollout calculations; their mean
 versus summed KL conventions remain distinct.
 
+While the decoder is frozen, its natural root and successor codes are cached
+once. Refinement streams preparation in bounded batches and retains these
+compact targets instead of accumulating natural KV states across the dataset.
+Joint fitting recomputes targets as the decoder changes. Continuation sampling
+in the belief-state adapter uses one teacher pass per observed token.
+
 Evaluation reports means and standard errors over root rows. `single_kl` and
 `repeated_kl` are **summed** over the forecast horizon, in nats. `roundtrip_mse`
 is the root error per coordinate; `tracking_mse` averages successor errors per
@@ -253,6 +259,23 @@ tiny negative roundoff values. Limits and allowances are recorded in
 `initialization.json`; the starting encoder is always retained as a fallback.
 Refinement starts fresh Adam and new fixed continuation banks; it does not
 resume optimizer state. The demo's `--refine-steps` option runs this workflow.
+
+To reduce teacher evaluations, set `teacher_every=20` in `RefineConfig` (or in
+the CLI's refinement JSON). Nineteen updates then optimize only the root round
+trip, followed by one update with the full teacher objective. The final update
+also uses the full objective. The default, `teacher_every=1`, uses it on every
+update. Cheap updates use the root coefficient from the full objective,
+`roundtrip_weight + tracking_weight / (horizon + 1)`.
+
+All validation checks still use the full forecast horizon and all preservation
+limits. With alternating updates, an infeasible checkpoint restores the best
+eligible encoder and resets Adam's moments. Final selection retains the
+starting encoder as a fallback. The trace records update counts, elapsed time,
+and rollbacks; `initialization.json` records the selected step and timings.
+`FitConfig.teacher_every` also controls the frozen-decoder encoder stage of an
+initial fit; joint fitting always uses the full objective and selects by its
+full validation loss. Alternating updates change the optimization schedule,
+so compare prediction metrics as well as round-trip error.
 
 To retain intermediate refinement results, pass a new `checkpoint_directory`
 to `refine_encoder`. It saves the starting abstraction and each

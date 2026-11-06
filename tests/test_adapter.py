@@ -7,6 +7,8 @@ import torch
 from gbs import BeliefStateAdapter, Architecture, AttentionDecoder, AffineEncoder, GBSAbstraction
 from gbs.adapters import CacheModel
 from reference_transformer import Config, Transformer, rotary
+from gbs.data import encode_bank, make_bank
+from gbs.fit import abstraction_loss
 
 
 @pytest.fixture(params=list(itertools.product([False, True], [False, True])))
@@ -135,3 +137,54 @@ def test_checkpoint_rejects_missing_or_mismatched_architecture(tmp_path):
         with pytest.raises(ValueError, match="Only standard softmax attention"):
             BeliefStateAdapter(model)
         delattr(model.cfg, name)
+
+
+def test_single_pass_sampling_matches_generic_sampling(adapter, monkeypatch):
+    original = adapter._pass
+    calls = []
+    def counted(*args):
+        calls.append(1)
+        return original(*args)
+    monkeypatch.setattr(adapter, "_pass", counted)
+    for length in [0, 4]:
+        state = adapter.history_state(torch.randint(adapter.vocab_size, (3, length)))
+        uniforms = torch.rand(3, 3, dtype=adapter.dtype)
+        uniforms[0] = 0
+        uniforms[1] = 1
+        calls.clear()
+        expected_tokens, expected_probabilities = CacheModel.sample(adapter, state, uniforms)
+        assert len(calls) == 6
+        calls.clear()
+        tokens, probabilities = adapter.sample(state, uniforms)
+        assert len(calls) == 3
+        torch.testing.assert_close(tokens, expected_tokens)
+        torch.testing.assert_close(probabilities, expected_probabilities, atol=0, rtol=0)
+
+
+def test_cached_natural_targets_preserve_loss_and_encoder_gradients(adapter):
+    histories = torch.randint(adapter.vocab_size, (12, 4))
+    bank = make_bank(adapter, histories, 3, seed=7)
+    architecture = Architecture(2, 2, 8)
+    decoder = AttentionDecoder(adapter, architecture).requires_grad_(False)
+    codes = decoder(adapter, bank.states).detach()
+    encoder = AffineEncoder.initialize(adapter, bank.states, codes)
+    model = GBSAbstraction(adapter, decoder, encoder, architecture)
+    bank.anchors = torch.randn_like(codes)
+    cached = encode_bank(adapter, decoder, bank)
+    streamed = make_bank(adapter, histories, 3, seed=7, decoder=decoder)
+    for name in ["codes", "targets", "tokens", "reference"]:
+        torch.testing.assert_close(getattr(cached, name), getattr(streamed, name), atol=0, rtol=0)
+    assert not hasattr(cached, "states")
+    raw = abstraction_loss(model, bank)
+    encoded = abstraction_loss(model, cached)
+    for name in raw:
+        torch.testing.assert_close(raw[name], encoded[name], atol=1e-11, rtol=1e-11)
+    first = torch.autograd.grad(raw["total"], tuple(encoder.parameters()))
+    second = torch.autograd.grad(encoded["total"], tuple(encoder.parameters()))
+    for a, b in zip(first, second):
+        torch.testing.assert_close(a, b, atol=1e-10, rtol=1e-10)
+    decoder.requires_grad_(True)
+    with pytest.raises(ValueError, match="frozen decoder"):
+        encode_bank(adapter, decoder, bank)
+    with pytest.raises(ValueError, match="frozen decoder"):
+        abstraction_loss(model, cached)

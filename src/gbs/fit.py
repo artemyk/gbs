@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass, field
 import copy
 import json
 from pathlib import Path
+import time
 from typing import Callable
 
 import numpy as np
@@ -14,7 +15,7 @@ from torch import Tensor
 from .adapters import CacheModel
 from .ghmm import GHMM, fit_ghmm
 from .models import Architecture, AttentionDecoder, AffineEncoder, GBSAbstraction
-from .data import DEFAULT_EVALUATION_SEED, DataBank, check_history_pair, make_bank, prepare_histories
+from .data import DEFAULT_EVALUATION_SEED, DataBank, EncodedBank, check_history_pair, encode_bank, make_bank, prepare_histories
 
 
 @dataclass
@@ -39,6 +40,7 @@ class FitConfig:
     seed: int = 0
     max_outcomes: int = 65536
     allow_shared_histories: bool = False
+    teacher_every: int = 1
 
 
 @dataclass
@@ -52,6 +54,7 @@ class RefineConfig:
     preservation_slack: float = .05
     validate_every: int = 200
     seed: int = 0
+    teacher_every: int = 1
 
 
 @dataclass
@@ -72,6 +75,10 @@ class FitResult:
 def _validate_config(config):
     if config.batch_size < 1 or config.validate_every < 1 or config.horizon < 1:
         raise ValueError("Batch size, validation interval, and forecast horizon must be positive")
+    if not isinstance(config.teacher_every, int) or config.teacher_every < 1:
+        raise ValueError("teacher_every must be a positive integer")
+    if config.teacher_every > 1 and config.roundtrip_weight + config.tracking_weight == 0:
+        raise ValueError("Alternating updates require a positive round-trip or tracking weight")
     for key, value in asdict(config).items():
         if (key.endswith("_steps") or key == "steps") and value < 0:
             raise ValueError("Training steps cannot be negative")
@@ -85,14 +92,19 @@ def conditional_kl(reference, log_probabilities):
     return (reference*(reference.clamp_min(torch.finfo(reference.dtype).tiny).log()-log_probabilities)).sum(-1)
 
 
-def _path_terms(model, bank: DataBank):
+def _path_terms(model, bank: DataBank | EncodedBank):
     """Per-root errors shared by training and evaluation; natural targets are detached."""
-    code = model.decode(bank.states)
+    if isinstance(bank, EncodedBank) and any(parameter.requires_grad for parameter in model.decoder.parameters()):
+        raise ValueError("Cached natural targets require a frozen decoder")
+    code = bank.codes if isinstance(bank, EncodedBank) else model.decode(bank.states)
     written = model.encode(code)
     single_lp, written_states = model.adapter.trajectory(written, bank.tokens)
-    with torch.no_grad():
-        _, natural_states = model.adapter.trajectory(bank.states, bank.tokens)
-        targets = [model.decode(state) for state in natural_states]
+    if isinstance(bank, EncodedBank):
+        targets = bank.targets.unbind(1)
+    else:
+        with torch.no_grad():
+            _, natural_states = model.adapter.trajectory(bank.states, bank.tokens)
+            targets = [model.decode(state) for state in natural_states]
     return dict(roundtrip=(model.decode(written)-code.detach()).square().mean(1),
         tracking=torch.stack([(model.decode(state)-target).square().mean(1)
                               for state, target in zip(written_states, targets)], 1),
@@ -101,7 +113,7 @@ def _path_terms(model, bank: DataBank):
         coordinates=code.new_zeros(len(code)) if bank.anchors is None else (code-bank.anchors).square().mean(1))
 
 
-def abstraction_loss(model, bank: DataBank, *, tracking_weight=.1, coordinate_weight=.1, roundtrip_weight=.1):
+def abstraction_loss(model, bank: DataBank | EncodedBank, *, tracking_weight=.1, coordinate_weight=.1, roundtrip_weight=.1):
     """Mean token KLs plus tracking, coordinate anchoring, and explicit root round trip."""
     terms = _path_terms(model, bank)
     root_error = terms["roundtrip"].mean()
@@ -110,6 +122,15 @@ def abstraction_loss(model, bank: DataBank, *, tracking_weight=.1, coordinate_we
     total = .5*(single+repeated)+tracking_weight*tracking+coordinate_weight*coordinate+roundtrip_weight*root_error
     return dict(total=total, single=single, repeated=repeated, tracking=tracking,
                 coordinates=coordinate, roundtrip=root_error)
+
+
+def _encoder_loss(model, bank: EncodedBank, config, step, steps):
+    """Use the full objective periodically; other updates fit only its root round trip."""
+    if (step+1) % config.teacher_every == 0 or step+1 == steps:
+        return abstraction_loss(model, bank, tracking_weight=config.tracking_weight,
+            coordinate_weight=0, roundtrip_weight=config.roundtrip_weight)["total"], True
+    weight = config.roundtrip_weight + config.tracking_weight/(bank.tokens.shape[1]+1)
+    return weight*(model.decode(model.encode(bank.codes))-bank.codes).square().mean(), False
 
 
 def _interface_state(model):
@@ -207,13 +228,15 @@ def fit_abstraction(adapter: CacheModel, train_histories: Tensor, validation_his
     model = GBSAbstraction(adapter, decoder, encoder, architecture)
     for stage, steps in [("encoder", config.encoder_steps), ("joint", config.joint_steps)]:
         decoder.requires_grad_(stage == "joint")
+        stage_train = encode_bank(adapter, decoder, train) if stage == "encoder" else train
+        stage_valid = encode_bank(adapter, decoder, valid) if stage == "encoder" else valid
         optimizer = torch.optim.Adam([dict(params=encoder.parameters(), lr=config.encoder_lr),
                                       dict(params=decoder.parameters(), lr=config.joint_decoder_lr)])
         best, best_state = float("inf"), None
         for step in range(steps+1):
             if step % config.validate_every == 0 or step == steps:
                 with torch.no_grad():
-                    totals = [float(abstraction_loss(model, valid.select(slice(left, left+256)),
+                    totals = [float(abstraction_loss(model, stage_valid.select(slice(left, left+256)),
                         tracking_weight=config.tracking_weight, coordinate_weight=config.coordinate_weight,
                         roundtrip_weight=config.roundtrip_weight)["total"])*min(256, len(valid.states)-left)
                         for left in range(0, len(valid.states), 256)]
@@ -226,10 +249,13 @@ def fit_abstraction(adapter: CacheModel, train_histories: Tensor, validation_his
             optimizer.param_groups[0]["lr"] = config.encoder_lr*fraction
             optimizer.param_groups[1]["lr"] = config.joint_decoder_lr*fraction
             ids = torch.tensor(rng.integers(len(train.states), size=config.batch_size), device=adapter.device)
-            terms = abstraction_loss(model, train.select(ids), tracking_weight=config.tracking_weight,
-                coordinate_weight=config.coordinate_weight, roundtrip_weight=config.roundtrip_weight)
+            if stage == "encoder":
+                loss, _ = _encoder_loss(model, stage_train.select(ids), config, step, steps)
+            else:
+                loss = abstraction_loss(model, stage_train.select(ids), tracking_weight=config.tracking_weight,
+                    coordinate_weight=config.coordinate_weight, roundtrip_weight=config.roundtrip_weight)["total"]
             optimizer.zero_grad(set_to_none=True)
-            terms["total"].backward()
+            loss.backward()
             torch.nn.utils.clip_grad_norm_([*encoder.parameters(), *decoder.parameters()], 1., error_if_nonfinite=True)
             optimizer.step()
         _restore(model, best_state)
@@ -238,9 +264,9 @@ def fit_abstraction(adapter: CacheModel, train_histories: Tensor, validation_his
 
 
 @torch.no_grad()
-def _evaluate_bank(model, bank: DataBank):
+def _evaluate_bank(model, bank: DataBank | EncodedBank):
     rows = {key: [] for key in ["roundtrip_mse", "single_kl", "repeated_kl", "tracking_mse"]}
-    for left in range(0, len(bank.states), 256):
+    for left in range(0, len(bank.tokens), 256):
         data = bank.select(slice(left, left+256))
         terms = _path_terms(model, data)
         rows["roundtrip_mse"].append(terms["roundtrip"])
@@ -272,10 +298,17 @@ def refine_encoder(model, train_histories, validation_histories, *, config=None,
     This starts fresh Adam and samples new continuation banks. The starting
     encoder is always an eligible checkpoint. Existing model weights are
     updated in place; save the original abstraction first to retain it.
+    Natural targets are cached once with the decoder frozen. teacher_every=1
+    uses the full loss on every update. Larger values interleave cheap root
+    round-trip updates and a full teacher update at that interval (and the end).
+    Infeasible validation checkpoints roll back the encoder and reset Adam
+    when alternating updates are enabled. Final selection always uses the full
+    validation metrics, with the starting encoder retained as a fallback.
     If checkpoint_directory is supplied, create a new directory and save each
     validation-selected best abstraction there, including the starting model.
     """
     config = config or RefineConfig()
+    started = time.perf_counter()
     _validate_config(config)
     if config.preservation_slack < 0: raise ValueError("preservation_slack cannot be negative")
     train_histories = prepare_histories(train_histories, model.adapter.vocab_size)
@@ -284,9 +317,11 @@ def refine_encoder(model, train_histories, validation_histories, *, config=None,
     model.adapter.eval().requires_grad_(False)
     model.decoder.requires_grad_(False)
     initial_decoder = copy.deepcopy(model.decoder.state_dict())
-    train = make_bank(model.adapter, train_histories, config.horizon, seed=config.seed+10)
-    valid = make_bank(model.adapter, validation_histories, config.horizon, seed=config.seed+11)
+    train = make_bank(model.adapter, train_histories, config.horizon, seed=config.seed+10, decoder=model.decoder)
+    valid = make_bank(model.adapter, validation_histories, config.horizon, seed=config.seed+11, decoder=model.decoder)
+    prepared = time.perf_counter()
     starting = _evaluate_bank(model, valid)
+    validation_seconds = time.perf_counter()-prepared
     limits = {key: max(0., starting[key]["mean"])*(1+config.preservation_slack)
               for key in ["single_kl", "repeated_kl", "tracking_mse"]}
     # KL is summed over time, so allow one machine epsilon per token.
@@ -294,18 +329,29 @@ def refine_encoder(model, train_histories, validation_histories, *, config=None,
     tolerances = {key: epsilon*(config.horizon if key.endswith("kl") else 1) for key in limits}
     optimizer = torch.optim.Adam(model.encoder.parameters(), lr=config.lr)
     rng = np.random.default_rng(config.seed)
-    trace, best, best_state = [], starting["roundtrip_mse"]["mean"], _interface_state(model)
+    trace, best, best_state = [], starting["roundtrip_mse"]["mean"], copy.deepcopy(model.encoder.state_dict())
+    selected_step, teacher_steps, roundtrip_steps, rollbacks = 0, 0, 0, 0
     if checkpoint_directory is not None:
         checkpoint_directory = Path(checkpoint_directory)
         checkpoint_directory.mkdir(parents=True, exist_ok=False)
     for step in range(config.steps+1):
         if step % config.validate_every == 0 or step == config.steps:
+            validation_started = time.perf_counter()
             measured = starting if step == 0 else _evaluate_bank(model, valid)
+            validation_seconds += time.perf_counter()-validation_started
             feasible = all(measured[key]["mean"] <= value+tolerances[key] for key, value in limits.items())
-            trace.append(dict(stage="refine", step=step, feasible=feasible, metrics=measured))
+            rollback = config.teacher_every > 1 and not feasible
+            trace.append(dict(stage="refine", step=step, feasible=feasible, metrics=measured,
+                elapsed_seconds=time.perf_counter()-started, teacher_steps=teacher_steps,
+                roundtrip_steps=roundtrip_steps, rolled_back=rollback))
             improved = feasible and measured["roundtrip_mse"]["mean"] < best
             if improved:
-                best, best_state = measured["roundtrip_mse"]["mean"], _interface_state(model)
+                best, best_state = measured["roundtrip_mse"]["mean"], copy.deepcopy(model.encoder.state_dict())
+                selected_step = step
+            if rollback:
+                model.encoder.load_state_dict(best_state)
+                optimizer.state.clear()
+                rollbacks += 1
             if checkpoint_directory is not None and (step == 0 or improved):
                 model.save(checkpoint_directory/f"step-{step:06d}.pt")
                 (checkpoint_directory/f"step-{step:06d}.json").write_text(json.dumps(dict(
@@ -314,14 +360,19 @@ def refine_encoder(model, train_histories, validation_histories, *, config=None,
             if progress: progress(f"refine {step}/{config.steps}: round-trip MSE {measured['roundtrip_mse']['mean']:.6g}; feasible={feasible}")
         if step == config.steps: break
         optimizer.param_groups[0]["lr"] = config.lr*(.1+.45*(1+np.cos(np.pi*step/config.steps)))
-        ids = torch.tensor(rng.integers(len(train.states), size=config.batch_size), device=model.adapter.device)
-        loss = abstraction_loss(model, train.select(ids), tracking_weight=config.tracking_weight,
-                                coordinate_weight=0, roundtrip_weight=config.roundtrip_weight)["total"]
+        ids = torch.tensor(rng.integers(len(train.tokens), size=config.batch_size), device=model.adapter.device)
+        loss, teacher_step = _encoder_loss(model, train.select(ids), config, step, config.steps)
+        teacher_steps += int(teacher_step)
+        roundtrip_steps += int(not teacher_step)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.encoder.parameters(), 1., error_if_nonfinite=True)
         optimizer.step()
-    _restore(model, best_state)
+    model.encoder.load_state_dict(best_state)
     assert all(torch.equal(value, model.decoder.state_dict()[key]) for key, value in initial_decoder.items())
     return FitResult(model.eval(), asdict(config), trace,
-                     dict(validation_limits=limits, validation_tolerances=tolerances))
+                     dict(validation_limits=limits, validation_tolerances=tolerances,
+                         selected_step=selected_step, teacher_steps=teacher_steps,
+                         roundtrip_steps=roundtrip_steps, rollbacks=rollbacks,
+                         timing_seconds=dict(preparation=prepared-started, validation=validation_seconds,
+                                             total=time.perf_counter()-started)))

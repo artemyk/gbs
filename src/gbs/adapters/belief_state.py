@@ -147,6 +147,22 @@ class BeliefStateAdapter(CacheModel):
             keys, values = keys[:, 1:], values[:, 1:]
         return lp[:, 0], self._pack(keys, values, F.one_hot(tokens, self.token_features).to(states.dtype), n+1)
 
+    @torch.no_grad()
+    def sample(self, states, uniforms):
+        """Sample using one teacher pass per token; cache construction precedes observation."""
+        tokens, probabilities = [], []
+        dummy = torch.zeros(len(states), 1, dtype=torch.long, device=states.device)
+        for uniform in uniforms.unbind(1):
+            lp, keys, values, n = self._pass(states, dummy)
+            q = lp[:, 0].exp()
+            token = (uniform[:, None] >= q.cumsum(1)).sum(1).clamp_max(self.vocab_size-1)
+            if n == 0 and not self.bos_visible:
+                keys, values = keys[:, 1:], values[:, 1:]
+            states = self._pack(keys, values, F.one_hot(token, self.token_features).to(states.dtype), n+1)
+            tokens.append(token)
+            probabilities.append(q)
+        return torch.stack(tokens, 1), torch.stack(probabilities, 1)
+
     def trajectory(self, states, tokens):
         lp, keys, values, n = self._pass(states, tokens)
         past = (states.shape[1]-self.token_features-1)//self.entry_width

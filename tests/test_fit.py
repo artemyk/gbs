@@ -155,3 +155,91 @@ def test_loss_and_gradients_match_an_independent_sequential_rollout():
             assert first is None and second is None
         else:
             torch.testing.assert_close(first, second, atol=1e-11, rtol=1e-11)
+
+
+@pytest.mark.parametrize("force_rollback", [False, True])
+def test_alternating_refinement_checks_full_metrics_and_keeps_a_safe_fallback(force_rollback, monkeypatch):
+    import gbs.fit as fitting
+    adapter = CoinMixture()
+    histories = words(2, 4)
+    model = fit_abstraction(adapter, histories[::2], histories[1::2], config=FitConfig(
+        dimension=1, queries_per_head=1, hidden=4, horizon=2, future_length=2,
+        spectral_samples=20, decoder_steps=2, encoder_steps=0, joint_steps=0), progress=None).abstraction
+    original = copy.deepcopy(model.encoder.state_dict())
+    evaluate_bank = fitting._evaluate_bank
+    calls = []
+    def measured(*args):
+        metrics = evaluate_bank(*args)
+        calls.append(metrics)
+        if force_rollback and len(calls) > 1:
+            metrics["tracking_mse"]["mean"] += calls[0]["tracking_mse"]["mean"]+1
+        return metrics
+    monkeypatch.setattr(fitting, "_evaluate_bank", measured)
+    result = refine_encoder(model, histories[::2], histories[1::2], config=RefineConfig(
+        steps=5, horizon=2, batch_size=4, validate_every=2, teacher_every=3), progress=None)
+    assert result.initialization["teacher_steps"] == 2
+    assert result.initialization["roundtrip_steps"] == 3
+    assert len(calls) == 4
+    assert result.initialization["timing_seconds"]["preparation"] >= 0
+    if force_rollback:
+        assert result.initialization["rollbacks"] == 3
+        assert result.initialization["selected_step"] == 0
+        assert all(torch.equal(value, model.encoder.state_dict()[key]) for key, value in original.items())
+    else:
+        selected = next(row for row in result.trace if row["step"] == result.initialization["selected_step"])
+        assert selected["feasible"]
+
+
+@pytest.mark.parametrize("interval", [0, -1, 1.5])
+def test_invalid_teacher_update_intervals_are_rejected(interval):
+    with pytest.raises(ValueError, match="teacher_every"):
+        refine_encoder(None, None, None, config=RefineConfig(teacher_every=interval), progress=None)
+
+
+def test_cheap_encoder_update_uses_no_teacher_rollout(monkeypatch):
+    from gbs import Architecture, AttentionDecoder, AffineEncoder
+    from gbs.data import encode_bank
+    from gbs.fit import _encoder_loss
+    adapter = CoinMixture()
+    roots = words(2, 3)
+    bank = make_bank(adapter, roots, 2, seed=17)
+    architecture = Architecture(1, 1, 4)
+    decoder = AttentionDecoder(adapter, architecture).requires_grad_(False)
+    encoder = AffineEncoder.initialize(adapter, bank.states, decoder(adapter, bank.states))
+    model = GBSAbstraction(adapter, decoder, encoder, architecture)
+    cached = encode_bank(adapter, decoder, bank)
+    calls = []
+    advance = adapter.advance
+    def counted(*args):
+        calls.append(1)
+        return advance(*args)
+    monkeypatch.setattr(adapter, "advance", counted)
+    config = RefineConfig(teacher_every=3)
+    loss, full = _encoder_loss(model, cached, config, 0, 3)
+    loss.backward()
+    assert not full and not calls
+    assert encoder.linear.weight.grad is not None
+    _, full = _encoder_loss(model, cached, config, 2, 3)
+    assert full and calls
+
+
+def test_encoded_bank_preparation_streams_before_building_the_next_raw_batch():
+    from gbs import Architecture, AttentionDecoder
+    class CountingTeacher(CoinMixture):
+        def __init__(self):
+            super().__init__()
+            self.prepared = []
+        def history_state(self, histories):
+            self.prepared.append(len(histories))
+            return super().history_state(histories)
+    adapter = CountingTeacher()
+    decoder = AttentionDecoder(adapter, Architecture(1, 1, 4)).requires_grad_(False)
+    decoded_after = []
+    hook = decoder.register_forward_pre_hook(lambda *args: decoded_after.append(sum(adapter.prepared)))
+    try:
+        bank = make_bank(adapter, words(2, 9), 2, seed=5, batch_size=64, decoder=decoder)
+    finally:
+        hook.remove()
+    assert decoded_after[0] == 64
+    assert sum(adapter.prepared) == 512 and max(adapter.prepared) == 64
+    assert len(bank.codes) == 512 and not hasattr(bank, "states")
