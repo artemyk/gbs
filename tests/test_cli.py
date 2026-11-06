@@ -1,4 +1,5 @@
 from dataclasses import asdict
+import hashlib
 import json
 
 import pytest
@@ -16,7 +17,7 @@ def inputs(request, tmp_path):
     teacher = Transformer(Config(bos_visible=True, **request.param))
     checkpoint = tmp_path/"teacher.pt"
     torch.save(dict(config=asdict(teacher.cfg), model=teacher.state_dict()), checkpoint)
-    roots = words(teacher.cfg.vocab, 3)
+    roots = words(teacher.cfg.vocab, 3).to(torch.uint8)
     splits = dict(train=roots[:12], validation=roots[12:20], test=roots[20:])
     histories = tmp_path/"histories.pt"
     torch.save(splits, histories)
@@ -51,6 +52,9 @@ def test_shared_fit_refine_and_evaluate_commands(inputs, tmp_path):
     metadata = json.loads((refined/"run.json").read_text())
     assert metadata["teacher_fingerprint"] == adapter.fingerprint()
     assert metadata["command"] == "refine"
+    assert metadata["histories_sha256"] == hashlib.sha256((refined/"histories.pt").read_bytes()).hexdigest()
+    assert metadata["input_histories_sha256"] == hashlib.sha256(histories.read_bytes()).hexdigest()
+    assert metadata["evaluation_seed"] == 1000
     with pytest.raises(SystemExit):
         main(["fit", *common, "--output", str(fitted), "--config", str(config)])
 

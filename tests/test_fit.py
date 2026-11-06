@@ -6,7 +6,8 @@ from torch import nn
 
 from gbs import CacheModel, FitConfig, RefineConfig, fit_abstraction, refine_encoder, evaluate, GBSAbstraction
 from gbs.adapters import words
-from gbs.fit import abstraction_loss, make_bank, conditional_kl
+from gbs.fit import abstraction_loss, conditional_kl
+from gbs.data import make_bank
 
 
 class CoinMixture(CacheModel):
@@ -85,3 +86,61 @@ def test_repeated_compression_kl_matches_exact_joint_kl():
     joint_kl.backward()
     assert model.encoder.linear.weight.grad.norm() > 0
     assert adapter.anchor.grad is None
+
+
+def test_fitting_builds_each_root_cache_once_in_bounded_batches():
+    class CountingTeacher(CoinMixture):
+        def __init__(self):
+            super().__init__()
+            self.prepared = []
+
+        def history_state(self, history):
+            self.prepared.append(len(history))
+            return super().history_state(history)
+
+    adapter = CountingTeacher()
+    histories = words(2, 10)
+    fit_abstraction(adapter, histories[:512], histories[512:],
+        initializer=lambda h: h.double().sum(1, keepdim=True), config=FitConfig(
+            dimension=1, queries_per_head=1, hidden=4, horizon=2,
+            decoder_steps=0, encoder_steps=0, joint_steps=0), progress=None)
+    assert sum(adapter.prepared) == len(histories)
+    assert max(adapter.prepared) <= 256
+
+
+def test_loss_and_gradients_match_an_independent_sequential_rollout():
+    adapter = CoinMixture()
+    histories = words(2, 4)
+    result = fit_abstraction(adapter, histories[::2], histories[1::2], config=FitConfig(
+        dimension=1, queries_per_head=1, hidden=4, horizon=3, future_length=2,
+        spectral_samples=20, decoder_steps=2, encoder_steps=0, joint_steps=0), progress=None)
+    model = result.abstraction
+    bank = make_bank(adapter, histories[:4], 3, seed=17)
+    bank.anchors = torch.zeros(4, 1, dtype=adapter.dtype)
+    code = model.decode(bank.states)
+    written = model.encode(code)
+    natural, single, repeated = bank.states, written, code
+    tracking = [(model.decode(written)-code.detach()).square().mean()]
+    single_kl, repeated_kl = [], []
+    for j, token in enumerate(bank.tokens.unbind(1)):
+        lp, single = adapter.advance(single, token)
+        with torch.no_grad():
+            _, natural = adapter.advance(natural, token)
+            target = model.decode(natural)
+        tracking.append((model.decode(single)-target).square().mean())
+        induced_lp, successor = adapter.advance(model.encode(repeated), token)
+        repeated = model.decode(successor)
+        single_kl.append(conditional_kl(bank.reference[:, j], lp).mean())
+        repeated_kl.append(conditional_kl(bank.reference[:, j], induced_lp).mean())
+    expected = (.5*(torch.stack(single_kl).mean()+torch.stack(repeated_kl).mean())
+                +.1*torch.stack(tracking).mean()+.1*code.square().mean()+.1*tracking[0])
+    actual = abstraction_loss(model, bank)["total"]
+    torch.testing.assert_close(actual, expected, atol=1e-12, rtol=1e-12)
+    parameters = [p for p in model.parameters() if p.requires_grad]
+    a = torch.autograd.grad(actual, parameters, allow_unused=True)
+    b = torch.autograd.grad(expected, parameters, allow_unused=True)
+    for first, second in zip(a, b):
+        if first is None or second is None:
+            assert first is None and second is None
+        else:
+            torch.testing.assert_close(first, second, atol=1e-11, rtol=1e-11)

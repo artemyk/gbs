@@ -6,6 +6,7 @@ import torch
 from torch import Tensor, nn
 
 from .adapters import CacheModel
+from .data import prepare_histories, token_ids
 
 
 class GHMM(nn.Module):
@@ -25,12 +26,14 @@ class GHMM(nn.Module):
         return state @ self.operators[:, :, 0].T
 
     def update(self, state, token):
-        joint = state @ self.operators[token] if isinstance(token, int) else torch.einsum("bi,bij->bj", state, self.operators[token])
+        token = token_ids(torch.as_tensor(token), len(self.operators), device=self.operators.device)
+        joint = torch.einsum("...i,...ij->...j", state, self.operators[token])
         if not bool(torch.isfinite(joint).all()) or bool((joint[:, 0].abs() < 1e-12).any()):
             raise ValueError("GHMM normalization is zero or nonfinite")
         return joint/joint[:, :1]
 
     def states(self, histories):
+        histories = prepare_histories(histories, len(self.operators), device=self.initial.device)
         state = self.initial.expand(len(histories), -1)
         for token in histories.unbind(1):
             state = self.update(state, token)

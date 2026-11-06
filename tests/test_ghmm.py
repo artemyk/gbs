@@ -37,3 +37,15 @@ def test_invalid_probabilities_are_not_hidden():
     with pytest.raises(ValueError, match="max_outcomes"): words(10, 8)
     with pytest.raises(ValueError, match="probability"):
         spectral_operators(np.array([[-.1, .2, .3, .6]]), [.5, .5], 2, 2, 1)
+
+
+@pytest.mark.parametrize("dtype", [torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8])
+def test_integer_tokens_have_the_same_categorical_meaning(dtype):
+    model = GHMM(torch.tensor([[[.2, 0.], [.5, .7]], [[.8, 0.], [-.5, .3]]]), torch.tensor([1., .5]))
+    histories = torch.tensor([[0, 1], [1, 0], [0, 0]], dtype=dtype)
+    torch.testing.assert_close(model.states(histories), model.states(histories.long()))
+    initial = model.initial.expand(3, -1)
+    torch.testing.assert_close(model.update(initial, histories[:, 0]), model.update(initial, histories[:, 0].long()))
+    torch.testing.assert_close(model.update(initial, torch.tensor(0, dtype=dtype)), model.update(initial, 0))
+    with pytest.raises(ValueError, match="integer"):
+        model.update(initial, True)

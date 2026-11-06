@@ -88,10 +88,15 @@ Outputs include:
   and coordinate transformation, and validation checkpoints;
 - `test_metrics.json`: evaluation on the test histories with independent teacher
   continuations;
-- `histories.pt` and `demo.json`: data splits, seeds, checkpoint hash and URL,
+- `histories.pt` and `run.json`: data splits, seeds, checkpoint hash and URL,
   source commit for the pinned demo, model configuration, and library versions;
 - `geometry.png` with `--plot`: projections of decoded states and their encoder
   round trips, colored by the last two tokens.
+
+The demo and CLI use the same artifact writer. Both default to evaluation seed
+1000, independent of the training seed; use `--evaluation-seed` to change it.
+Refinement writes a complete record in the `refined/` subdirectory, including
+its history splits and the starting abstraction's hash.
 
 The quick run checks the workflow; it is not a converged fit. No convergence or
 prediction-accuracy threshold is assumed by the fitter.
@@ -125,6 +130,9 @@ configuration, and validation trace. The same default evaluation seed is used
 across commands; set `--evaluation-seed` to change it. `--device` and `--threads`
 control execution. The commands call the shared Python fitting API below;
 there are no separate encoder or fitting branches for BOS and attention variants.
+Integer histories are validated and converted to `torch.long` before indexing;
+floating-point histories are rejected. The history hash in `run.json` identifies
+the saved normalized splits; the CLI also records the original input-file hash.
 
 ## Fit a model
 
@@ -209,6 +217,11 @@ The frozen teacher receives no parameter updates; gradients flow through its
 operations into written states. Configuration dataclasses expose dimensions,
 optimization steps, learning rates, loss weights, seeds, and validation cadence.
 
+Natural caches are constructed once in batches of at most 256 roots and reused
+for decoder regression, encoder initialization, and the continuation banks.
+Training and evaluation share the per-root rollout calculations; their mean
+versus summed KL conventions remain distinct.
+
 Evaluation reports means and standard errors over root rows. `single_kl` and
 `repeated_kl` are **summed** over the forecast horizon, in nats. `roundtrip_mse`
 is the root error per coordinate; `tracking_mse` averages successor errors per
@@ -234,6 +247,11 @@ and tracking MSE must each remain within 5% of their initial validation values.
 Among eligible checkpoints, select the smallest round-trip MSE; the starting
 encoder remains eligible. These are empirical validation constraints, not a
 guarantee on unseen histories. Report independent test metrics afterward.
+For roundoff near zero, preservation limits use a nonnegative baseline plus an
+absolute allowance of one machine epsilon per forecast token for summed KL,
+and one epsilon for tracking MSE. Raw measured KL values are retained, including
+tiny negative roundoff values. Limits and allowances are recorded in
+`initialization.json`; the starting encoder is always retained as a fallback.
 Refinement starts fresh Adam and new fixed continuation banks; it does not
 resume optimizer state. The demo's `--refine-steps` option runs this workflow.
 
@@ -272,6 +290,8 @@ histories to initial coordinates, to bypass spectral fitting. A GHMM's first,
 constant coordinate is omitted from the decoder targets. Custom callables
 return exactly `FitConfig.dimension` coordinates. Whitening and all encoder
 scaling are fitted on training roots only.
+Reused GHMMs are evaluated on their own device and in their stored precision;
+the resulting coordinates are then transferred to the teacher's device and dtype.
 
 The spectral initializer enumerates all vocabulary-sized futures up to
 `future_length + 1`. This is intended for small alphabets and short horizons;

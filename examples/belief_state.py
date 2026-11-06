@@ -7,7 +7,6 @@ beliefs are passed to the fitter.
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict
 import hashlib
 import json
 from pathlib import Path
@@ -15,8 +14,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from gbs import (BeliefStateAdapter, FitConfig, GBSAbstraction, RefineConfig,
-                 evaluate, fit_abstraction, refine_encoder)
+from gbs import BeliefStateAdapter, FitConfig, RefineConfig, fit_abstraction, refine_encoder
+from gbs.data import DEFAULT_EVALUATION_SEED, history_splits
+from gbs.runs import save_run
 
 
 DEMO_COMMIT = "61c2a5570ce7df8ca5a739b2ecc0a27716cea5c4"
@@ -101,6 +101,7 @@ def main():
     parser.add_argument("--device", choices=["cpu", "mps", "cuda"], default="cpu")
     parser.add_argument("--samples", type=int, help="4096 by default; 256 with --quick")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--evaluation-seed", type=int, default=DEFAULT_EVALUATION_SEED)
     parser.add_argument("--epsilon", type=float, default=.05, help="MRRXOR history distribution; match the checkpoint")
     parser.add_argument("--threads", type=int, default=2)
     parser.add_argument("--quick", action="store_true", help="Small end-to-end smoke run, not a converged fit")
@@ -119,27 +120,16 @@ def main():
         config = FitConfig(seed=args.seed, spectral_samples=128, decoder_steps=200,
             encoder_steps=100, joint_steps=200, batch_size=32, horizon=8, validate_every=100)
     histories = sample_histories(args.samples or (256 if args.quick else 4096), 16, args.epsilon, args.seed)
-    train, validation, test = split_histories(histories, args.seed+1)
+    splits = history_splits(dict(zip(["train", "validation", "test"], split_histories(histories, args.seed+1))), adapter, config.horizon)
+    train, validation, test = (splits[name] for name in ["train", "validation", "test"])
     print(f"Device: {adapter.device}; train/validation/test rows: {len(train)}/{len(validation)}/{len(test)}", flush=True)
     progress = lambda message: print(message, flush=True)
     result = fit_abstraction(adapter, train, validation, config=config, progress=progress)
-    result.save(args.output)
-    metrics = evaluate(result.abstraction, test, horizon=config.horizon, seed=args.seed+1000)
-    (args.output/"test_metrics.json").write_text(json.dumps(metrics, indent=2)+"\n")
-    torch.save(dict(train=train, validation=validation, test=test), args.output/"histories.pt")
-    # Verify the saved artifact against the exact teacher used for this run.
-    loaded = GBSAbstraction.load(args.output/"abstraction.pt", adapter)
-    with torch.no_grad():
-        states = adapter.history_state(test[:8].to(adapter.device))
-        torch.testing.assert_close(loaded.decode(states), result.abstraction.decode(states), rtol=0, atol=0)
-    metadata = dict(seed=args.seed, epsilon=args.epsilon, device=args.device,
-        torch_version=str(torch.__version__), numpy_version=np.__version__,
+    metadata = dict(command="demo", data_seed=args.seed, epsilon=args.epsilon,
         checkpoint_url=DEMO_URL if args.checkpoint is None else None,
-        teacher_commit=DEMO_COMMIT if args.checkpoint is None else None,
-        teacher_config=adapter.spec()["config"], teacher_fingerprint=adapter.fingerprint(),
-        checkpoint_sha256=hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
-        split_sizes=dict(train=len(train), validation=len(validation), test=len(test)), fit=asdict(config))
-    (args.output/"demo.json").write_text(json.dumps(metadata, indent=2)+"\n")
+        teacher_commit=DEMO_COMMIT if args.checkpoint is None else None)
+    metrics = save_run(args.output, result.abstraction, splits, teacher_checkpoint=checkpoint,
+        horizon=config.horizon, evaluation_seed=args.evaluation_seed, result=result, metadata=metadata)
     print(json.dumps(metrics, indent=2), flush=True)
     if args.plot:
         geometry(result.abstraction, test, args.output/"geometry.png")
@@ -147,9 +137,9 @@ def main():
         refined = refine_encoder(result.abstraction, train, validation, config=RefineConfig(
             steps=args.refine_steps, horizon=config.horizon, batch_size=config.batch_size,
             validate_every=config.validate_every, roundtrip_weight=.3, seed=args.seed+2000), progress=progress)
-        refined.save(args.output/"refined")
-        metrics = evaluate(refined.abstraction, test, horizon=config.horizon, seed=args.seed+1000)
-        (args.output/"refined/test_metrics.json").write_text(json.dumps(metrics, indent=2)+"\n")
+        save_run(args.output/"refined", refined.abstraction, splits, teacher_checkpoint=checkpoint,
+            horizon=config.horizon, evaluation_seed=args.evaluation_seed, result=refined,
+            metadata=dict(metadata, command="refine"), initial_abstraction=args.output/"abstraction.pt")
     print(f"Saved fit to {args.output}", flush=True)
 
 

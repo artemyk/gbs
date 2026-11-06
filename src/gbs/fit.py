@@ -14,6 +14,7 @@ from torch import Tensor
 from .adapters import CacheModel
 from .ghmm import GHMM, fit_ghmm
 from .models import Architecture, AttentionDecoder, AffineEncoder, GBSAbstraction
+from .data import DEFAULT_EVALUATION_SEED, DataBank, check_history_pair, make_bank, prepare_histories
 
 
 @dataclass
@@ -54,18 +55,6 @@ class RefineConfig:
 
 
 @dataclass
-class DataBank:
-    states: Tensor
-    tokens: Tensor
-    reference: Tensor
-    anchors: Tensor | None = None
-
-    def select(self, ids):
-        return DataBank(self.states[ids], self.tokens[ids], self.reference[ids],
-                        None if self.anchors is None else self.anchors[ids])
-
-
-@dataclass
 class FitResult:
     abstraction: GBSAbstraction
     config: dict
@@ -92,51 +81,32 @@ def _validate_config(config):
             raise ValueError("Loss weights cannot be negative")
 
 
-def _check_histories(adapter, train, validation, horizon, allow_shared):
-    if train.ndim != 2 or validation.ndim != 2 or not len(train) or not len(validation):
-        raise ValueError("Provide nonempty, two-dimensional training and validation histories")
-    if train.shape[1] != validation.shape[1] or train.shape[1] < 1:
-        raise ValueError("This fitter uses one nonempty root history length")
-    if adapter.max_history is not None and train.shape[1]+horizon > adapter.max_history:
-        raise ValueError("Root length plus forecast horizon exceeds the teacher context")
-    if not allow_shared:
-        roots = {tuple(row) for row in train.cpu().tolist()}
-        if any(tuple(row) in roots for row in validation.cpu().tolist()):
-            raise ValueError("Training/validation histories overlap; split by distinct root or explicitly allow_shared_histories")
-
-
-@torch.no_grad()
-def make_bank(adapter, histories, horizon, *, seed, anchors=None, batch_size=256):
-    rng = np.random.default_rng(seed)
-    states, tokens, reference = [], [], []
-    for left in range(0, len(histories), batch_size):
-        raw = adapter.history_state(histories[left:left+batch_size].to(adapter.device))
-        uniforms = torch.tensor(rng.random((len(raw), horizon)), device=adapter.device, dtype=adapter.dtype)
-        token, q = adapter.sample(raw, uniforms)
-        states.append(raw)
-        tokens.append(token)
-        reference.append(q)
-    return DataBank(torch.cat(states), torch.cat(tokens), torch.cat(reference), anchors)
-
-
 def conditional_kl(reference, log_probabilities):
     return (reference*(reference.clamp_min(torch.finfo(reference.dtype).tiny).log()-log_probabilities)).sum(-1)
 
 
-def abstraction_loss(model, bank, *, tracking_weight=.1, coordinate_weight=.1, roundtrip_weight=.1):
-    """Mean token KLs plus tracking, coordinate anchoring, and explicit root round trip."""
+def _path_terms(model, bank: DataBank):
+    """Per-root errors shared by training and evaluation; natural targets are detached."""
     code = model.decode(bank.states)
     written = model.encode(code)
     single_lp, written_states = model.adapter.trajectory(written, bank.tokens)
     with torch.no_grad():
         _, natural_states = model.adapter.trajectory(bank.states, bank.tokens)
         targets = [model.decode(state) for state in natural_states]
-    root_error = (model.decode(written)-code.detach()).square().mean()
-    tracking = torch.stack([root_error]+[(model.decode(state)-target).square().mean()
-                                      for state, target in zip(written_states, targets)]).mean()
-    single = conditional_kl(bank.reference, single_lp).mean()
-    repeated = conditional_kl(bank.reference, model.repeated(code, bank.tokens)).mean()
-    coordinate = code.new_zeros(()) if bank.anchors is None else (code-bank.anchors).square().mean()
+    return dict(roundtrip=(model.decode(written)-code.detach()).square().mean(1),
+        tracking=torch.stack([(model.decode(state)-target).square().mean(1)
+                              for state, target in zip(written_states, targets)], 1),
+        single=conditional_kl(bank.reference, single_lp),
+        repeated=conditional_kl(bank.reference, model.repeated(code, bank.tokens)),
+        coordinates=code.new_zeros(len(code)) if bank.anchors is None else (code-bank.anchors).square().mean(1))
+
+
+def abstraction_loss(model, bank: DataBank, *, tracking_weight=.1, coordinate_weight=.1, roundtrip_weight=.1):
+    """Mean token KLs plus tracking, coordinate anchoring, and explicit root round trip."""
+    terms = _path_terms(model, bank)
+    root_error = terms["roundtrip"].mean()
+    tracking = torch.cat([terms["roundtrip"][:, None], terms["tracking"]], 1).mean()
+    single, repeated, coordinate = (terms[key].mean() for key in ["single", "repeated", "coordinates"])
     total = .5*(single+repeated)+tracking_weight*tracking+coordinate_weight*coordinate+roundtrip_weight*root_error
     return dict(total=total, single=single, repeated=repeated, tracking=tracking,
                 coordinates=coordinate, roundtrip=root_error)
@@ -173,7 +143,9 @@ def fit_abstraction(adapter: CacheModel, train_histories: Tensor, validation_his
     """
     config = config or FitConfig()
     _validate_config(config)
-    _check_histories(adapter, train_histories, validation_histories, config.horizon, config.allow_shared_histories)
+    train_histories = prepare_histories(train_histories, adapter.vocab_size)
+    validation_histories = prepare_histories(validation_histories, adapter.vocab_size)
+    check_history_pair(adapter, train_histories, validation_histories, config.horizon, config.allow_shared_histories)
     adapter.eval().requires_grad_(False)
     torch.manual_seed(config.seed)
     rng = np.random.default_rng(config.seed)
@@ -196,19 +168,23 @@ def fit_abstraction(adapter: CacheModel, train_histories: Tensor, validation_his
             horizon=config.future_length, max_outcomes=config.max_outcomes)
     with torch.no_grad():
         if isinstance(initializer, GHMM):
-            target = lambda h: initializer.states(h.to(adapter.device))[:, 1:]
+            target = lambda h: initializer.states(h)[:, 1:]
+            target_device = initializer.initial.device
         else:
             target = initializer
-        train_target = target(train_histories.to(adapter.device)).detach().to(device=adapter.device, dtype=adapter.dtype)
-        validation_target = target(validation_histories.to(adapter.device)).detach().to(train_target)
+            target_device = adapter.device
+        train_target = target(train_histories.to(target_device)).detach().to(device=adapter.device, dtype=adapter.dtype)
+        validation_target = target(validation_histories.to(target_device)).detach().to(train_target)
         if train_target.shape != (len(train_histories), config.dimension) or validation_target.shape != (len(validation_histories), config.dimension):
             raise ValueError("Initializer must return one dimension-sized code per history")
         if not bool(torch.isfinite(train_target).all() and torch.isfinite(validation_target).all()):
             raise ValueError("Initialization produced nonfinite coordinates")
         center, whitener = _weighted_coordinate_transform(train_target)
         train_target, validation_target = (train_target-center)@whitener, (validation_target-center)@whitener
-        train_states = adapter.history_state(train_histories.to(adapter.device))
-        validation_states = adapter.history_state(validation_histories.to(adapter.device))
+    if progress: progress("Preparing natural caches and fixed teacher continuation banks")
+    train = make_bank(adapter, train_histories, config.horizon, seed=config.seed+10, anchors=train_target)
+    valid = make_bank(adapter, validation_histories, config.horizon, seed=config.seed+11, anchors=validation_target)
+    train_states, validation_states = train.states, valid.states
     architecture = Architecture(config.dimension, config.queries_per_head, config.hidden)
     decoder = AttentionDecoder(adapter, architecture)
     optimizer = torch.optim.Adam(decoder.parameters(), lr=config.decoder_lr)
@@ -229,9 +205,6 @@ def fit_abstraction(adapter: CacheModel, train_histories: Tensor, validation_his
     decoder.load_state_dict(best_state)
     encoder = AffineEncoder.initialize(adapter, train_states, train_target)
     model = GBSAbstraction(adapter, decoder, encoder, architecture)
-    if progress: progress("Sampling fixed teacher continuation banks")
-    train = make_bank(adapter, train_histories, config.horizon, seed=config.seed+10, anchors=train_target)
-    valid = make_bank(adapter, validation_histories, config.horizon, seed=config.seed+11, anchors=validation_target)
     for stage, steps in [("encoder", config.encoder_steps), ("joint", config.joint_steps)]:
         decoder.requires_grad_(stage == "joint")
         optimizer = torch.optim.Adam([dict(params=encoder.parameters(), lr=config.encoder_lr),
@@ -265,19 +238,15 @@ def fit_abstraction(adapter: CacheModel, train_histories: Tensor, validation_his
 
 
 @torch.no_grad()
-def _evaluate_bank(model, bank):
+def _evaluate_bank(model, bank: DataBank):
     rows = {key: [] for key in ["roundtrip_mse", "single_kl", "repeated_kl", "tracking_mse"]}
     for left in range(0, len(bank.states), 256):
         data = bank.select(slice(left, left+256))
-        code = model.decode(data.states)
-        written = model.encode(code)
-        lp, trajectory = model.adapter.trajectory(written, data.tokens)
-        _, natural = model.adapter.trajectory(data.states, data.tokens)
-        rows["roundtrip_mse"].append((model.decode(written)-code).square().mean(1))
-        rows["single_kl"].append(conditional_kl(data.reference, lp).sum(1))
-        rows["repeated_kl"].append(conditional_kl(data.reference, model.repeated(code, data.tokens)).sum(1))
-        rows["tracking_mse"].append(torch.stack([(model.decode(a)-model.decode(b)).square().mean(1)
-                                                for a, b in zip(trajectory, natural)], 1).mean(1))
+        terms = _path_terms(model, data)
+        rows["roundtrip_mse"].append(terms["roundtrip"])
+        rows["single_kl"].append(terms["single"].sum(1))
+        rows["repeated_kl"].append(terms["repeated"].sum(1))
+        rows["tracking_mse"].append(terms["tracking"].mean(1))
     summary = {}
     for key, parts in rows.items():
         value = torch.cat(parts)
@@ -286,9 +255,10 @@ def _evaluate_bank(model, bank):
     return summary
 
 
-def evaluate(model, histories, *, horizon=16, seed=1000):
+def evaluate(model, histories, *, horizon=16, seed=DEFAULT_EVALUATION_SEED):
     """Evaluate on independent teacher draws; predictive KL is summed over horizon."""
-    if histories.ndim != 2 or len(histories) < 2 or horizon < 1:
+    histories = prepare_histories(histories, model.adapter.vocab_size, min_rows=2)
+    if horizon < 1:
         raise ValueError("Evaluation requires at least two histories and a positive horizon")
     model.eval()
     bank = make_bank(model.adapter, histories, horizon, seed=seed)
@@ -305,21 +275,27 @@ def refine_encoder(model, train_histories, validation_histories, *, config=None,
     config = config or RefineConfig()
     _validate_config(config)
     if config.preservation_slack < 0: raise ValueError("preservation_slack cannot be negative")
-    _check_histories(model.adapter, train_histories, validation_histories, config.horizon, False)
+    train_histories = prepare_histories(train_histories, model.adapter.vocab_size)
+    validation_histories = prepare_histories(validation_histories, model.adapter.vocab_size, min_rows=2)
+    check_history_pair(model.adapter, train_histories, validation_histories, config.horizon)
     model.adapter.eval().requires_grad_(False)
     model.decoder.requires_grad_(False)
     initial_decoder = copy.deepcopy(model.decoder.state_dict())
     train = make_bank(model.adapter, train_histories, config.horizon, seed=config.seed+10)
     valid = make_bank(model.adapter, validation_histories, config.horizon, seed=config.seed+11)
     starting = _evaluate_bank(model, valid)
-    limits = {key: starting[key]["mean"]*(1+config.preservation_slack) for key in ["single_kl", "repeated_kl", "tracking_mse"]}
+    limits = {key: max(0., starting[key]["mean"])*(1+config.preservation_slack)
+              for key in ["single_kl", "repeated_kl", "tracking_mse"]}
+    # KL is summed over time, so allow one machine epsilon per token.
+    epsilon = torch.finfo(model.adapter.dtype).eps
+    tolerances = {key: epsilon*(config.horizon if key.endswith("kl") else 1) for key in limits}
     optimizer = torch.optim.Adam(model.encoder.parameters(), lr=config.lr)
     rng = np.random.default_rng(config.seed)
-    trace, best, best_state = [], float("inf"), None
+    trace, best, best_state = [], starting["roundtrip_mse"]["mean"], _interface_state(model)
     for step in range(config.steps+1):
         if step % config.validate_every == 0 or step == config.steps:
-            measured = _evaluate_bank(model, valid)
-            feasible = all(measured[key]["mean"] <= value+1e-12 for key, value in limits.items())
+            measured = starting if step == 0 else _evaluate_bank(model, valid)
+            feasible = all(measured[key]["mean"] <= value+tolerances[key] for key, value in limits.items())
             trace.append(dict(stage="refine", step=step, feasible=feasible, metrics=measured))
             if feasible and measured["roundtrip_mse"]["mean"] < best:
                 best, best_state = measured["roundtrip_mse"]["mean"], _interface_state(model)
@@ -335,4 +311,5 @@ def refine_encoder(model, train_histories, validation_histories, *, config=None,
         optimizer.step()
     _restore(model, best_state)
     assert all(torch.equal(value, model.decoder.state_dict()[key]) for key, value in initial_decoder.items())
-    return FitResult(model.eval(), asdict(config), trace, dict(validation_limits=limits))
+    return FitResult(model.eval(), asdict(config), trace,
+                     dict(validation_limits=limits, validation_tolerances=tolerances))

@@ -4,11 +4,11 @@ from __future__ import annotations
 from dataclasses import asdict
 
 import torch
-from torch import Tensor
 import torch.nn.functional as F
 
 from .base import CacheModel
 from ._belief_state_model import Config, Transformer, attention_projection, rotate
+from ..data import prepare_histories
 
 
 class BeliefStateAdapter(CacheModel):
@@ -91,12 +91,10 @@ class BeliefStateAdapter(CacheModel):
 
     @torch.no_grad()
     def history_state(self, histories):
-        histories = histories.to(device=self.device, dtype=torch.long)
-        if histories.ndim != 2 or len(histories) == 0:
-            raise ValueError("histories must be a nonempty batch of equally long token sequences")
+        histories = prepare_histories(histories, self.vocab_size, device=self.device)
         batch, n = histories.shape
-        if n > self.max_history or bool(((histories < 0) | (histories >= self.vocab_size)).any()):
-            raise ValueError("History exceeds context or contains an invalid token")
+        if n > self.max_history:
+            raise ValueError("History exceeds context")
         empty = self.model.embed.weight.new_empty(batch, 0, self.n_layers, self.n_heads, self.head_dim)
         bos = F.one_hot(torch.full((batch,), self.vocab_size, device=self.device), self.token_features).to(self.dtype)
         start = self._pack(empty, empty, bos, 0)
