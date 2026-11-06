@@ -14,7 +14,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from gbs import BeliefStateAdapter, FitConfig, RefineConfig, fit_abstraction, refine_encoder
+from gbs import TransformersAdapter, FitConfig, RefineConfig, fit_abstraction, refine_encoder
 from gbs.data import DEFAULT_EVALUATION_SEED, history_splits
 from gbs.runs import save_run
 
@@ -114,7 +114,7 @@ def main():
         parser.error("refine-steps cannot be negative")
     torch.set_num_threads(args.threads)
     checkpoint = args.checkpoint or demo_checkpoint(args.checkpoint_dir)
-    adapter = BeliefStateAdapter.from_checkpoint(checkpoint, device=args.device)
+    adapter = TransformersAdapter.from_checkpoint(checkpoint, device=args.device)
     config = FitConfig(seed=args.seed)
     if args.quick:
         config = FitConfig(seed=args.seed, spectral_samples=128, decoder_steps=200,

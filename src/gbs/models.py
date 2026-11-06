@@ -39,7 +39,7 @@ class AttentionDecoder(nn.Module):
 
 
 class AffineEncoder(nn.Module):
-    """An affine writer with fixed structural metadata and train-only scaling."""
+    """An affine state writer with train-only scaling and adapter-defined writable coordinates."""
     def __init__(self, dimension, mean, scale, writable):
         super().__init__()
         self.register_buffer("mean", mean)

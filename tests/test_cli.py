@@ -1,4 +1,3 @@
-from dataclasses import asdict
 import itertools
 import hashlib
 import json
@@ -6,20 +5,20 @@ import json
 import pytest
 import torch
 
-from gbs import BeliefStateAdapter, GBSAbstraction
+from gbs import TransformersAdapter, GBSAbstraction
 from gbs.adapters import words
 from gbs.cli import main
-from reference_transformer import Config, Transformer
+from native_transformer import make_model, native_log_probs
 
 
 @pytest.fixture(params=list(itertools.product([False, True], [False, True])))
 def inputs(request, tmp_path):
     torch.manual_seed(5)
     rope, bos_visible = request.param
-    teacher = Transformer(Config(rope=rope, bos_visible=bos_visible))
-    checkpoint = tmp_path/"teacher.pt"
-    torch.save(dict(config=asdict(teacher.cfg), model=teacher.state_dict()), checkpoint)
-    roots = words(teacher.cfg.vocab, 3).to(torch.uint8)
+    teacher = make_model(rope=rope, bos_visible=bos_visible)
+    checkpoint = tmp_path/"teacher"
+    teacher.save_pretrained(checkpoint)
+    roots = words(len(teacher.config.gbs["token_ids"]), 3).to(torch.uint8)
     splits = dict(train=roots[:12], validation=roots[12:20], test=roots[20:])
     histories = tmp_path/"histories.pt"
     torch.save(splits, histories)
@@ -36,13 +35,12 @@ def test_shared_fit_refine_and_evaluate_commands(inputs, tmp_path):
     common = ["--teacher", str(checkpoint), "--histories", str(histories)]
     fitted = tmp_path/"fit"
     main(["fit", *common, "--output", str(fitted), "--config", str(config)])
-    adapter = BeliefStateAdapter.from_checkpoint(checkpoint)
+    adapter = TransformersAdapter.from_checkpoint(checkpoint)
     model = GBSAbstraction.load(fitted/"abstraction.pt", adapter)
     trace = json.loads((fitted/"trace.json").read_text())
     assert {row["stage"] for row in trace} == {
         "decoder", "encoder", "encoder_refine", "joint", "joint_refine"}
-    assert bool(model.encoder.writable[:-1].all())
-    assert not bool(model.encoder.writable[-1])
+    assert bool(model.encoder.writable.all())
     before = {key: value.clone() for key, value in model.decoder.state_dict().items()}
     refine_config = tmp_path/"refine.json"
     refine_config.write_text(json.dumps(dict(steps=1, horizon=2, batch_size=2, validate_every=1, seed=10)))

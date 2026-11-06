@@ -32,7 +32,7 @@ class CacheModel(nn.Module, ABC):
     """
     vocab_size: int
     n_layers: int
-    n_heads: int
+    n_heads: int  # Unique KV heads; grouped-query models can have more query heads.
     head_dim: int
     token_features: int
     max_history: int | None = None
@@ -57,7 +57,7 @@ class CacheModel(nn.Module, ABC):
     def features(self, states: Tensor, queries: Tensor) -> Tensor:
         """Read current-token coordinates and normalized attention responses only.
 
-        Queries have shape (layers, heads, queries_per_head, head_dim).
+        Queries have shape (layers, KV heads, queries_per_head, head_dim).
         Return shape (batch, token_features + L H Q head_dim).
         Use zeros for attention measurements of an empty cache.
         """
