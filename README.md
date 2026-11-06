@@ -96,6 +96,36 @@ Outputs include:
 The quick run checks the workflow; it is not a converged fit. No convergence or
 prediction-accuracy threshold is assumed by the fitter.
 
+## Shared experiment commands
+
+Use the same commands for every supported teacher configuration. Supply a
+checkpoint and a `histories.pt` dictionary with disjoint `train`, `validation`,
+and `test` integer tensors. The demo saves a file in this format. Optional JSON
+configuration files contain fields of `FitConfig` or `RefineConfig`.
+
+```sh
+python -m gbs fit --teacher model.pt --histories histories.pt --output outputs/fit
+python -m gbs refine --teacher model.pt --histories histories.pt \
+  --abstraction outputs/fit/abstraction.pt --config refine.json --output outputs/refined
+python -m gbs evaluate --teacher model.pt --histories histories.pt \
+  --abstraction outputs/refined/abstraction.pt --horizon 16 --output outputs/evaluation
+```
+
+After installation, `gbs` is also available as a console command. For example,
+`refine.json` can contain:
+
+```json
+{"steps": 10000, "horizon": 16, "roundtrip_weight": 0.3, "seed": 2000}
+```
+
+Each command requires a new output directory and records test metrics, input
+hashes, teacher identity, the history splits, numerical library versions, and
+the evaluation seed. Fit and refinement commands also save the abstraction,
+configuration, and validation trace. The same default evaluation seed is used
+across commands; set `--evaluation-seed` to change it. `--device` and `--threads`
+control execution. The commands call the shared Python fitting API below;
+there are no separate encoder or fitting branches for BOS and attention variants.
+
 ## Fit a model
 
 ```python
@@ -262,6 +292,8 @@ initialization, split isolation, artifact reload, and frozen-decoder refinement.
 Exact enumeration also checks the sequence-KL chain rule for repeated
 compression. CI runs the suite on Python 3.10 and 3.12.
 
+Native and cached execution share the teacher's attention projection, and
+natural states are built using the same cache execution as interventions.
 The included checkpoint architecture follows
 [belief-state](https://github.com/artemyk/belief-state); the demo uses its MRRXOR
 process. Both repositories are available under the MIT license. This package

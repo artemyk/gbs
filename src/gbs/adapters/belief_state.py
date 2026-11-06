@@ -8,7 +8,7 @@ from torch import Tensor
 import torch.nn.functional as F
 
 from .base import CacheModel
-from ._belief_state_model import Config, Transformer, rotate
+from ._belief_state_model import Config, Transformer, attention_projection, rotate
 
 
 class BeliefStateAdapter(CacheModel):
@@ -82,24 +82,6 @@ class BeliefStateAdapter(CacheModel):
         mask[-1] = False
         return mask
 
-    def _project(self, block, q, k, v, mask):
-        mass_weight = getattr(block, "mass_weight", None)
-        if mass_weight is None:
-            response = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
-            normalizer = None
-        else:
-            scores = (q @ k.transpose(-2, -1)) * self.head_dim**-.5
-            scores = scores.masked_fill(~mask, float("-inf"))
-            if getattr(block, "attention_sums", False):
-                weights = scores.exp()
-                response, normalizer = weights @ v, weights.sum(-1)
-            else:
-                response, normalizer = scores.softmax(-1) @ v, scores.logsumexp(-1)
-        result = block.out(response.transpose(1, 2).flatten(2))
-        if normalizer is not None:
-            result = result + F.linear(normalizer.transpose(1, 2), mass_weight)
-        return result
-
     def _qkv(self, block, x, positions):
         batch, length, _ = x.shape
         q, k, v = block.qkv(block.ln1(x)).reshape(batch, length, 3, self.n_heads, self.head_dim).permute(2, 0, 3, 1, 4)
@@ -115,26 +97,12 @@ class BeliefStateAdapter(CacheModel):
         batch, n = histories.shape
         if n > self.max_history or bool(((histories < 0) | (histories >= self.vocab_size)).any()):
             raise ValueError("History exceeds context or contains an invalid token")
+        empty = self.model.embed.weight.new_empty(batch, 0, self.n_layers, self.n_heads, self.head_dim)
+        bos = F.one_hot(torch.full((batch,), self.vocab_size, device=self.device), self.token_features).to(self.dtype)
+        start = self._pack(empty, empty, bos, 0)
         if n == 0:
-            empty = self.model.embed.weight.new_empty(batch, 0, self.n_layers, self.n_heads, self.head_dim)
-            token = F.one_hot(torch.full((batch,), self.vocab_size, device=self.device), self.token_features).to(self.dtype)
-            return self._pack(empty, empty, token, 0)
-        inputs = torch.cat([torch.full_like(histories[:, :1], self.vocab_size), histories[:, :-1]], 1)
-        x = self.model.embed(inputs)
-        positions = torch.arange(n, device=self.device)
-        if self.model.pos_embed is not None:
-            x = x + self.model.pos_embed(positions)
-        mask = torch.ones(n, n, dtype=torch.bool, device=self.device).tril()
-        if not self.bos_visible:
-            mask[1:, 0] = False
-        keys, values = [], []
-        for block in self.model.blocks:
-            q, k, v = self._qkv(block, x, positions)
-            x = x + self._project(block, q, k, v, mask)
-            x = x + block.mlp(block.ln2(x))
-            keys.append(k.transpose(1, 2))
-            values.append(v.transpose(1, 2))
-        keys, values = torch.stack(keys, 2), torch.stack(values, 2)
+            return start
+        _, keys, values, _ = self._pass(start, histories)
         if not self.bos_visible:
             keys, values = keys[:, 1:], values[:, 1:]
         return self._pack(keys, values, F.one_hot(histories[:, -1], self.token_features).to(self.dtype), n)
@@ -157,7 +125,7 @@ class BeliefStateAdapter(CacheModel):
             q, k, v = self._qkv(block, x, positions)
             k = torch.cat([keys[:, :, layer].transpose(1, 2), k], 2)
             v = torch.cat([values[:, :, layer].transpose(1, 2), v], 2)
-            x = x + self._project(block, q, k, v, mask)
+            x = x + attention_projection(block, q, k, v, mask)
             x = x + block.mlp(block.ln2(x))
             all_k.append(k.transpose(1, 2))
             all_v.append(v.transpose(1, 2))

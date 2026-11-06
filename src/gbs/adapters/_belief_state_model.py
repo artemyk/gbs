@@ -43,6 +43,26 @@ def rotate(x, positions):
     return torch.cat([a*cos-b*sin, a*sin+b*cos], -1)
 
 
+def attention_projection(block, q, k, v, mask):
+    """The teacher's attention projection, shared by native and cached execution."""
+    mass_weight = getattr(block, "mass_weight", None)
+    if mass_weight is None:
+        response = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        denominator = None
+    else:
+        scores = (q @ k.transpose(-2, -1))*q.shape[-1]**-.5
+        scores = scores.masked_fill(~mask, float('-inf'))
+        if getattr(block, "attention_sums", False):
+            weights = scores.exp()
+            response, denominator = weights @ v, weights.sum(-1)
+        else:
+            response, denominator = scores.softmax(-1) @ v, scores.logsumexp(-1)
+    projected = block.out(response.transpose(1, 2).flatten(2))
+    if denominator is not None:
+        projected = projected+F.linear(denominator.transpose(1, 2), mass_weight)
+    return projected
+
+
 class Block(nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -62,20 +82,7 @@ class Block(nn.Module):
         if self.rope:
             positions = torch.arange(length, device=x.device)
             q, k = rotate(q, positions), rotate(k, positions)
-        if self.mass_weight is None:
-            response = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
-            denominator = None
-        else:
-            scores = (q @ k.transpose(-2, -1))*self.d_head**-.5
-            scores = scores.masked_fill(~mask, float('-inf'))
-            if self.attention_sums:
-                weights = scores.exp()
-                response, denominator = weights @ v, weights.sum(-1)
-            else:
-                response, denominator = scores.softmax(-1) @ v, scores.logsumexp(-1)
-        x = x + self.out(response.transpose(1, 2).flatten(2))
-        if denominator is not None:
-            x = x + F.linear(denominator.transpose(1, 2), self.mass_weight)
+        x = x+attention_projection(self, q, k, v, mask)
         return x+self.mlp(self.ln2(x)), normalized
 
 

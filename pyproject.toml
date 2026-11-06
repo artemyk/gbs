@@ -12,6 +12,9 @@ license = "MIT"
 authors = [{name = "Artemy Kolchinsky"}]
 dependencies = ["torch>=2.2", "numpy>=1.24"]
 
+[project.scripts]
+gbs = "gbs.cli:main"
+
 [project.urls]
 Repository = "https://github.com/artemyk/gbs"
 
