@@ -111,7 +111,7 @@ class BeliefStateAdapter(CacheModel):
             keys, values = keys[:, 1:], values[:, 1:]
         return self._pack(keys, values, F.one_hot(histories[:, -1], self.token_features).to(self.dtype), n)
 
-    def _pass(self, states, tokens, *, return_queries=False):
+    def _pass(self, states, tokens):
         keys, values, current, n = self._unpack(states)
         batch, horizon = tokens.shape
         if horizon < 1 or n+horizon > self.max_history:
@@ -124,11 +124,9 @@ class BeliefStateAdapter(CacheModel):
         mask = torch.arange(past+horizon, device=states.device)[None] <= past+torch.arange(horizon, device=states.device)[:, None]
         if n == 0 and not self.bos_visible:
             mask[1:, 0] = False
-        all_k, all_v, queries = [], [], []
+        all_k, all_v = [], []
         for layer, block in enumerate(self.model.blocks):
             q, k, v = self._qkv(block, x)
-            if return_queries:
-                queries.append(q)
             if self.rope:
                 q, k = rotate(q, positions), rotate(k, positions)
             k = torch.cat([keys[:, :, layer].transpose(1, 2), k], 2)
@@ -137,14 +135,7 @@ class BeliefStateAdapter(CacheModel):
             x = x + block.mlp(block.ln2(x))
             all_k.append(k.transpose(1, 2))
             all_v.append(v.transpose(1, 2))
-        result = (self.model.unembed(self.model.ln_final(x)).log_softmax(-1), torch.stack(all_k, 2), torch.stack(all_v, 2), n)
-        return (*result, torch.stack(queries, 1)) if return_queries else result
-
-    @torch.no_grad()
-    def observed_queries(self, states):
-        """Read native queries in the shared frame, before RoPE is applied."""
-        tokens = torch.zeros(len(states), 1, dtype=torch.long, device=states.device)
-        return self._pass(states, tokens, return_queries=True)[4][:, :, :, 0]
+        return self.model.unembed(self.model.ln_final(x)).log_softmax(-1), torch.stack(all_k, 2), torch.stack(all_v, 2), n
 
     def predict(self, states):
         tokens = torch.zeros(len(states), 1, dtype=torch.long, device=states.device)

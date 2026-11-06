@@ -66,14 +66,6 @@ class CacheModel(nn.Module, ABC):
         """Writable coordinates; override to exclude structural metadata."""
         return torch.ones(state.shape[1], dtype=torch.bool, device=state.device)
 
-    def observed_queries(self, states: Tensor) -> Tensor:
-        """Native queries before positional rotation, shaped (batch, layers, heads, head_dim).
-
-        Optional capability for fitting a fixed observed-query decoder. It must
-        return the queries used to predict the next token from each natural state.
-        """
-        raise ValueError("This adapter does not expose observed queries")
-
     def spec(self) -> dict:
         """JSON metadata identifying state semantics, beyond frozen parameter values."""
         return dict(adapter=type(self).__qualname__, vocab=self.vocab_size,

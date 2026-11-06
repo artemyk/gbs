@@ -346,3 +346,70 @@ def test_invalid_preservation_slack_is_rejected_before_preparing_data(config):
             fit_abstraction(None, None, None, config=config, progress=None)
         else:
             refine_encoder(None, None, None, config=config, progress=None)
+
+
+@pytest.mark.parametrize("field", ["tracking_weight", "coordinate_weight", "roundtrip_weight",
+    "refine_roundtrip_weight", "encoder_lr", "joint_decoder_lr", "refine_lr"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+def test_nonfinite_fit_settings_fail_before_teacher_preparation(field, value):
+    with pytest.raises(ValueError, match=field):
+        fit_abstraction(None, None, None, config=FitConfig(**{field: value}), progress=None)
+
+
+@pytest.mark.parametrize("field", ["tracking_weight", "roundtrip_weight", "lr", "preservation_slack"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+def test_nonfinite_refinement_settings_fail_before_teacher_preparation(field, value):
+    with pytest.raises(ValueError, match=field):
+        refine_encoder(None, None, None, config=RefineConfig(**{field: value}), progress=None)
+
+
+@pytest.mark.parametrize("config_type,field", [(FitConfig, "encoder_steps"),
+    (FitConfig, "joint_refine_steps"), (FitConfig, "future_length"),
+    (RefineConfig, "steps"), (RefineConfig, "teacher_every"), (RefineConfig, "batch_size")])
+@pytest.mark.parametrize("value", [1.5, float("nan"), True])
+def test_noninteger_counts_fail_before_teacher_preparation(config_type, field, value):
+    with pytest.raises(ValueError, match=field):
+        config = config_type(**{field: value})
+        if config_type is FitConfig:
+            fit_abstraction(None, None, None, config=config, progress=None)
+        else:
+            refine_encoder(None, None, None, config=config, progress=None)
+
+
+def test_frozen_stages_skip_decoder_bookkeeping_and_all_stages_decay_learning_rates(monkeypatch):
+    from gbs import AttentionDecoder
+    from gbs.decoder import PrefixBank
+    measure, snapshot, step = PrefixBank.measure, AttentionDecoder.state_dict, torch.optim.Adam.step
+    measured, snapshots, rates = [], [], []
+
+    def measured_coordinates(bank, decoder, adapter):
+        measured.append(any(p.requires_grad for p in decoder.parameters()))
+        return measure(bank, decoder, adapter)
+
+    def snapshot_decoder(decoder, *args, **kwargs):
+        snapshots.append(any(p.requires_grad for p in decoder.parameters()))
+        return snapshot(decoder, *args, **kwargs)
+
+    def record_update(optimizer, *args, **kwargs):
+        assert all(p.requires_grad for group in optimizer.param_groups for p in group["params"])
+        rates.append([group["lr"] for group in optimizer.param_groups])
+        return step(optimizer, *args, **kwargs)
+
+    monkeypatch.setattr(PrefixBank, "measure", measured_coordinates)
+    monkeypatch.setattr(AttentionDecoder, "state_dict", snapshot_decoder)
+    monkeypatch.setattr(torch.optim.Adam, "step", record_update)
+    roots = words(2, 4)
+    result = fit_abstraction(CoinMixture(), roots[::2], roots[1::2], config=FitConfig(
+        dimension=1, queries_per_head=1, hidden=4, horizon=2, decoder_steps=0,
+        encoder_steps=4, encoder_refine_steps=4, joint_steps=4, joint_refine_steps=4,
+        teacher_every=3, validate_every=1),
+        initializer=lambda h: h.double().sum(1, keepdim=True), progress=None)
+    assert measured and all(measured)
+    assert snapshots and all(snapshots)
+    encoder_rows = [r for r in result.trace if r["stage"] == "encoder"]
+    assert len({r["validation_coordinate_mse"] for r in encoder_rows}) == 1
+    assert len(rates) == 16
+    starts = [[3e-4], [1e-4], [3e-4, 1e-4], [1e-4]]
+    for start, expected in zip(range(0, 16, 4), starts):
+        assert rates[start] == expected
+        assert rates[start+3] == pytest.approx([rate*.23180194846605365 for rate in expected])

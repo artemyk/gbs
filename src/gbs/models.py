@@ -8,14 +8,18 @@ import torch
 from torch import nn
 
 from .adapters import CacheModel
+from ._training import require_integer
 
 
 @dataclass
 class Architecture:
     dimension: int = 4
     queries_per_head: int = 8
-    hidden: int | None = 128
-    learn_queries: bool = True
+    hidden: int = 128
+
+    def __post_init__(self):
+        for name in ("dimension", "queries_per_head", "hidden"):
+            require_integer(name, getattr(self, name), minimum=1)
 
 
 class AttentionDecoder(nn.Module):
@@ -23,17 +27,11 @@ class AttentionDecoder(nn.Module):
         super().__init__()
         a = architecture
         self.dimension = a.dimension
-        if min(a.dimension, a.queries_per_head) < 1 or (a.hidden is not None and a.hidden < 1):
-            raise ValueError("Decoder dimensions must be positive")
         queries = torch.randn(adapter.n_layers, adapter.n_heads, a.queries_per_head, adapter.head_dim,
                               device=adapter.device, dtype=adapter.dtype)
-        if a.learn_queries:
-            self.queries = nn.Parameter(queries)
-        else:
-            self.register_buffer("queries", queries)
+        self.queries = nn.Parameter(queries)
         inputs = adapter.token_features + adapter.n_layers*adapter.n_heads*a.queries_per_head*adapter.head_dim
-        self.net = (nn.Linear(inputs, a.dimension) if a.hidden is None else
-                    nn.Sequential(nn.Linear(inputs, a.hidden), nn.Tanh(), nn.Linear(a.hidden, a.dimension)))
+        self.net = nn.Sequential(nn.Linear(inputs, a.hidden), nn.Tanh(), nn.Linear(a.hidden, a.dimension))
         self.net.to(device=adapter.device, dtype=adapter.dtype)
 
     def forward(self, adapter, states):
@@ -116,10 +114,15 @@ class GBSAbstraction(nn.Module):
     def load(cls, path, adapter):
         saved = torch.load(path, map_location=adapter.device, weights_only=True)
         if saved["format_version"] != 2:
-            raise ValueError("Unsupported abstraction format; refit using normalized-attention decoder inputs")
+            raise ValueError("Unsupported abstraction checkpoint format")
         if saved["teacher_fingerprint"] != adapter.fingerprint():
             raise ValueError("The abstraction does not match this teacher/adapter")
-        architecture = Architecture(**saved["architecture"])
+        architecture_fields = dict(saved["architecture"])
+        # Existing final fits record this property in their checkpoint metadata.
+        # It no longer selects a decoder implementation.
+        if not architecture_fields.pop("learn_queries", True):
+            raise ValueError("The checkpoint does not contain learned decoder queries")
+        architecture = Architecture(**architecture_fields)
         decoder = AttentionDecoder(adapter, architecture)
         state = saved["encoder"]
         encoder = AffineEncoder(architecture.dimension, state["mean"], state["scale"], state["writable"])

@@ -17,6 +17,7 @@ from .ghmm import GHMM, fit_ghmm
 from .models import AffineEncoder, GBSAbstraction
 from .decoder import DecoderConfig, fit_decoder, validate_decoder_config
 from .data import DEFAULT_EVALUATION_SEED, DataBank, EncodedBank, check_history_pair, encode_bank, make_bank, prepare_histories
+from ._training import cosine_fraction, require_finite, require_integer
 
 
 @dataclass
@@ -70,23 +71,22 @@ class FitResult:
 
 
 def _validate_config(config):
-    if config.batch_size < 1 or config.validate_every < 1 or config.horizon < 1:
-        raise ValueError("Batch size, validation interval, and forecast horizon must be positive")
-    if not isinstance(config.teacher_every, int) or config.teacher_every < 1:
-        raise ValueError("teacher_every must be a positive integer")
-    if config.teacher_every > 1 and config.roundtrip_weight + config.tracking_weight == 0:
-        raise ValueError("Alternating updates require a positive round-trip or tracking weight")
-    if not np.isfinite(config.preservation_slack) or config.preservation_slack < 0:
-        raise ValueError("preservation_slack must be finite and nonnegative")
     if isinstance(config, FitConfig):
         validate_decoder_config(config)
     for key, value in asdict(config).items():
-        if (key.endswith("_steps") or key == "steps") and value < 0:
-            raise ValueError("Training steps cannot be negative")
-        if (key.endswith("_lr") or key == "lr") and value <= 0:
-            raise ValueError("Learning rates must be positive")
-        if key.endswith("_weight") and value < 0:
-            raise ValueError("Loss weights cannot be negative")
+        if isinstance(config, FitConfig) and key in DecoderConfig.__dataclass_fields__:
+            continue
+        if key.endswith("_steps") or key in ("steps", "seed"):
+            require_integer(key, value)
+        elif key in ("batch_size", "validate_every", "horizon", "teacher_every",
+                     "future_length", "spectral_samples", "max_outcomes"):
+            require_integer(key, value, minimum=1)
+        elif key.endswith("_lr") or key == "lr":
+            require_finite(key, value, positive=True)
+        elif key.endswith("_weight") or key == "preservation_slack":
+            require_finite(key, value)
+    if config.teacher_every > 1 and config.roundtrip_weight + config.tracking_weight == 0:
+        raise ValueError("Alternating updates require a positive round-trip or tracking weight")
 
 
 def conditional_kl(reference, log_probabilities):
@@ -132,15 +132,6 @@ def _encoder_loss(model, bank: EncodedBank, config, step, steps):
             coordinate_weight=0, roundtrip_weight=config.roundtrip_weight)["total"], True
     weight = config.roundtrip_weight + config.tracking_weight/(bank.tokens.shape[1]+1)
     return weight*(model.decode(model.encode(bank.codes))-bank.codes).square().mean(), False
-
-
-def _interface_state(model):
-    return copy.deepcopy((model.decoder.state_dict(), model.encoder.state_dict()))
-
-
-def _restore(model, state):
-    model.decoder.load_state_dict(state[0])
-    model.encoder.load_state_dict(state[1])
 
 
 def _weighted_coordinate_transform(codes):
@@ -231,8 +222,11 @@ def fit_abstraction(adapter: CacheModel, train_histories: Tensor, validation_his
         decoder.requires_grad_(stage == "joint")
         stage_train = encode_bank(adapter, decoder, train) if stage == "encoder" else train
         stage_valid = encode_bank(adapter, decoder, valid) if stage == "encoder" else valid
-        optimizer = torch.optim.Adam([dict(params=encoder.parameters(), lr=config.encoder_lr),
-                                      dict(params=decoder.parameters(), lr=config.joint_decoder_lr)])
+        modules = (encoder, decoder) if stage == "joint" else (encoder,)
+        rates = (config.encoder_lr, config.joint_decoder_lr)
+        parameters = [parameter for module in modules for parameter in module.parameters()]
+        optimizer = torch.optim.Adam([dict(params=module.parameters(), lr=rate)
+                                      for module, rate in zip(modules, rates)])
         best, best_state, selected_step = float("inf"), None, 0
         teacher_steps, roundtrip_steps = 0, 0
         for step in range(steps+1):
@@ -242,7 +236,11 @@ def fit_abstraction(adapter: CacheModel, train_histories: Tensor, validation_his
                         tracking_weight=config.tracking_weight, coordinate_weight=0,
                         roundtrip_weight=config.roundtrip_weight)["total"])*min(256, len(valid.states)-left)
                         for left in range(0, len(valid.states), 256)]
-                coordinate_score, by_length = decoder_result.validation.measure(decoder, adapter)
+                if stage == "joint":
+                    coordinate_score, by_length = decoder_result.validation.measure(decoder, adapter)
+                else:
+                    coordinate_score = decoder_result.diagnostics['validation_mse']
+                    by_length = decoder_result.diagnostics['validation_by_length']
                 score = sum(totals)/len(valid.states)+config.coordinate_weight*coordinate_score
                 trace.append(dict(stage=stage, step=step, validation_loss=score,
                                   validation_coordinate_mse=coordinate_score,
@@ -250,12 +248,13 @@ def fit_abstraction(adapter: CacheModel, train_histories: Tensor, validation_his
                                   elapsed_seconds=time.perf_counter()-started,
                                   teacher_steps=teacher_steps, roundtrip_steps=roundtrip_steps))
                 if score < best:
-                    best, best_state, selected_step = score, _interface_state(model), step
+                    best, selected_step = score, step
+                    best_state = copy.deepcopy([module.state_dict() for module in modules])
                 if progress: progress(f"{stage} {step}/{steps}: validation loss {score:.6g}")
             if step == steps: break
-            fraction = .1+.45*(1+np.cos(np.pi*step/steps))
-            optimizer.param_groups[0]["lr"] = config.encoder_lr*fraction
-            optimizer.param_groups[1]["lr"] = config.joint_decoder_lr*fraction
+            fraction = cosine_fraction(step, steps)
+            for group, rate in zip(optimizer.param_groups, rates):
+                group["lr"] = rate*fraction
             ids = torch.tensor(rng.integers(len(train.states), size=config.batch_size), device=adapter.device)
             if stage == "encoder":
                 loss, teacher_step = _encoder_loss(model, stage_train.select(ids), config, step, steps)
@@ -265,15 +264,16 @@ def fit_abstraction(adapter: CacheModel, train_histories: Tensor, validation_his
                     coordinate_weight=0, roundtrip_weight=config.roundtrip_weight)["total"]
                 if config.coordinate_weight:
                     x, y = decoder_result.training.sample(rng, config.batch_size)
-                    predicted = decoder_result.training.prediction(decoder, adapter, x)
+                    predicted = decoder(adapter, x)
                     loss = loss+config.coordinate_weight*(predicted-y).square().mean()
             teacher_steps += int(teacher_step)
             roundtrip_steps += int(not teacher_step)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_([*encoder.parameters(), *decoder.parameters()], 1., error_if_nonfinite=True)
+            torch.nn.utils.clip_grad_norm_(parameters, 1., error_if_nonfinite=True)
             optimizer.step()
-        _restore(model, best_state)
+        for module, state in zip(modules, best_state):
+            module.load_state_dict(state)
         diagnostics[stage] = dict(selected_step=selected_step, validation_loss=best,
             teacher_steps=teacher_steps, roundtrip_steps=roundtrip_steps,
             total_seconds=time.perf_counter()-started)
@@ -359,7 +359,6 @@ def _refine_encoder(model, train: EncodedBank, valid: EncodedBank, config, *, pr
                     checkpoint_directory=None):
     """Refine against fixed continuations and codes from the current frozen decoder."""
     _validate_config(config)
-    initial_decoder = copy.deepcopy(model.decoder.state_dict())
     prepared = time.perf_counter()
     starting = _evaluate_bank(model, valid)
     validation_seconds = time.perf_counter()-prepared
@@ -400,7 +399,7 @@ def _refine_encoder(model, train: EncodedBank, valid: EncodedBank, config, *, pr
                     validation_tolerances=tolerances), indent=2)+"\n")
             if progress: progress(f"refine {step}/{config.steps}: round-trip MSE {measured['roundtrip_mse']['mean']:.6g}; feasible={feasible}")
         if step == config.steps: break
-        optimizer.param_groups[0]["lr"] = config.lr*(.1+.45*(1+np.cos(np.pi*step/config.steps)))
+        optimizer.param_groups[0]["lr"] = config.lr*cosine_fraction(step, config.steps)
         ids = torch.tensor(rng.integers(len(train.tokens), size=config.batch_size), device=model.adapter.device)
         loss, teacher_step = _encoder_loss(model, train.select(ids), config, step, config.steps)
         teacher_steps += int(teacher_step)
@@ -410,7 +409,6 @@ def _refine_encoder(model, train: EncodedBank, valid: EncodedBank, config, *, pr
         torch.nn.utils.clip_grad_norm_(model.encoder.parameters(), 1., error_if_nonfinite=True)
         optimizer.step()
     model.encoder.load_state_dict(best_state)
-    assert all(torch.equal(value, model.decoder.state_dict()[key]) for key, value in initial_decoder.items())
     return FitResult(model.eval(), asdict(config), trace,
                      dict(validation_limits=limits, validation_tolerances=tolerances,
                          selected_step=selected_step, teacher_steps=teacher_steps,

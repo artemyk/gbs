@@ -246,21 +246,18 @@ representative root length. One set of decoder queries and one readout are
 shared across all lengths, with a single train-derived coordinate transform.
 Split parent histories first; short prefixes may coincide across splits.
 
-Set `decoder_method="observed"` to sample queries from natural training
-prefixes and freeze them. For RoPE, queries are collected **before** positional
-rotation; the adapter rotates this same bank at the length being decoded.
-Attention responses are cached once. `hidden=None` fits a linear readout by
-ridge regression, selecting its penalty on validation data;
-`hidden=128`, for example, trains only a tanh MLP on the cached features.
-The query bank stays fixed during subsequent joint fitting and after reload.
-`decoder_method="learned"` remains the default and optimizes both queries and
-readout. For decoder-only experiments, `fit_decoder` accepts `DecoderConfig`,
-parent sequences, and a callable giving coordinates in one shared basis.
-
-Trainable queries use random initialization and are optimized jointly with the
-readout across prefix lengths. Attention responses are recomputed as queries move.
-Validation trace entries include elapsed seconds from the start of fitting,
+The decoder uses random query initialization and a tanh MLP with a positive
+integer hidden width. Queries and readout are optimized together across prefix
+lengths, and both can change during joint fitting. For RoPE, the adapter rotates
+the same learned query templates to the position being decoded. Attention
+responses are recomputed as queries move. For decoder-only experiments,
+`fit_decoder` accepts `DecoderConfig`, parent sequences, and a callable giving
+coordinates in one shared basis.
+Decoder validation trace entries include elapsed seconds from the start of fitting,
 including query initialization and cache preparation.
+Configuration validation rejects nonfinite learning rates, loss weights, and
+preservation tolerances before preparing teacher data. Step counts, dimensions,
+and sampling counts must be integers in their documented ranges.
 
 There are two predictive losses. **Single insertion** writes the root once and
 lets the teacher's cache grow along a continuation. **Repeated compression**
@@ -289,7 +286,8 @@ optimization steps, learning rates, loss weights, seeds, and validation cadence.
 Natural root caches are constructed in batches of at most 256 roots and reused
 for encoder initialization and the continuation banks. Decoder pretraining
 separately prepares its sampled prefixes, retaining raw states for learned
-queries or cached attention features for frozen observed queries.
+queries. The frozen-decoder encoder stage reuses the decoder's selected
+coordinate-validation scores and optimizes and checkpoints only the encoder.
 Training and evaluation share the per-root rollout calculations; their mean
 versus summed KL conventions remain distinct.
 
@@ -374,10 +372,6 @@ another architecture, implement:
 
 Generic implementations supply sampling, sequential rollouts, future queries,
 and checkpoint fingerprints. A vectorized `trajectory` override is optional.
-The observed-query shortcut additionally requires `observed_queries(states)`,
-returning native next-token queries with shape `(batch, layers, heads, head_dim)`
-in the frame before positional rotation. Learned-query fitting does not require
-this method.
 Keep the teacher in evaluation mode, with gradients disabled on its parameters.
 This is an adapter interface, not an automatic loader for arbitrary transformer
 libraries.
@@ -416,10 +410,11 @@ sequential continuation gradients, attention measurements, BOS and position
 handling, affine-writer constraints, checkpoint matching, and spectral recovery
 of an analytic three-symbol process. An end-to-end fit checks default GHMM
 initialization, split isolation, artifact reload, and frozen-decoder refinement.
-Additional tests check native pre-RoPE query capture, prefix-length coverage,
-frozen query banks across joint fitting and reload, and ridge regression with
-collinear features. The complete staged fit checks continuation reuse, refreshed
-natural codes after joint fitting, and validation constraints in both refinements.
+Additional tests check learned-query updates, prefix-length coverage, bounded
+prefix preparation, and prediction preservation after reload. The complete
+staged fit checks continuation reuse, refreshed natural codes after joint
+fitting, and validation constraints in both refinements. Configuration tests
+check that invalid numeric settings fail before data preparation.
 Exact enumeration also checks the sequence-KL chain rule for repeated
 compression. CI runs the suite on Python 3.10 and 3.12.
 

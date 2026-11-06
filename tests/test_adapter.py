@@ -92,12 +92,12 @@ def test_encoder_fixed_coordinates_and_checkpoint_roundtrip(adapter, tmp_path):
     torch.testing.assert_close(restored.decode(written), model.decode(written), atol=0, rtol=0)
     torch.testing.assert_close(restored.encode(codes), model.encode(codes), atol=0, rtol=0)
     with pytest.raises(FileExistsError): model.save(path)
-    obsolete = torch.load(path, weights_only=True)
-    obsolete["format_version"] = 1
-    old_path = tmp_path/"obsolete.pt"
-    torch.save(obsolete, old_path)
-    with pytest.raises(ValueError, match="normalized-attention decoder inputs"):
-        GBSAbstraction.load(old_path, adapter)
+    malformed = torch.load(path, weights_only=True)
+    malformed["format_version"] = 999
+    malformed_path = tmp_path/"malformed.pt"
+    torch.save(malformed, malformed_path)
+    with pytest.raises(ValueError, match="Unsupported abstraction checkpoint format"):
+        GBSAbstraction.load(malformed_path, adapter)
     with torch.no_grad(): adapter.model.unembed.bias.add_(.01)
     with pytest.raises(ValueError, match="match"): GBSAbstraction.load(path, adapter)
 
@@ -188,21 +188,3 @@ def test_cached_natural_targets_preserve_loss_and_encoder_gradients(adapter):
         encode_bank(adapter, decoder, bank)
     with pytest.raises(ValueError, match="frozen decoder"):
         abstraction_loss(model, cached)
-
-
-def test_observed_queries_match_native_projection_before_rope(adapter):
-    tokens = torch.randint(adapter.vocab_size, (3, 12))
-    native = []
-    handles = [block.qkv.register_forward_hook(
-        lambda module, inputs, output: native.append(output.detach().clone()))
-        for block in adapter.model.blocks]
-    adapter.model(tokens)
-    for handle in handles:
-        handle.remove()
-    for n in [0, 1, 5, 11]:
-        queries = adapter.observed_queries(adapter.history_state(tokens[:, :n]))
-        expected = torch.stack([value.reshape(3, 12, 3, adapter.n_heads, adapter.head_dim)
-                                [:, n, 0] for value in native], 1)
-        torch.testing.assert_close(queries, expected, atol=1e-10, rtol=1e-10)
-        if adapter.rope and n:
-            assert not torch.allclose(queries, rotary(queries, n))
