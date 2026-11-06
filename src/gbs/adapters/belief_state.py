@@ -90,14 +90,6 @@ class BeliefStateAdapter(CacheModel):
         mask[-1] = False
         return mask
 
-    def value_mask(self, states, *, layers=None):
-        keys, _, _, _ = self._unpack(states)
-        mask = torch.zeros(states.shape[1], dtype=torch.bool, device=states.device)
-        kv = mask[:keys.shape[1]*self.entry_width].reshape(-1, self.n_layers, self.n_heads, 2, self.head_dim)
-        for layer in range(self.n_layers) if layers is None else layers:
-            kv[:, layer, :, 1] = True
-        return mask
-
     def _qkv(self, block, x, positions):
         batch, length, _ = x.shape
         q, k, v = block.qkv(block.ln1(x)).reshape(batch, length, 3, self.n_heads, self.head_dim).permute(2, 0, 3, 1, 4)
@@ -181,26 +173,13 @@ class BeliefStateAdapter(CacheModel):
             successors.append(self._pack(k, v, F.one_hot(tokens[:, t-1], self.token_features).to(states.dtype), n+t))
         return lp, successors
 
-    def _reader_weights(self, keys, queries, n):
-        if not keys.shape[1]:
-            return keys.new_zeros(len(keys), *queries.shape[:-1], 0)
-        q = rotate(queries, n) if self.rope else queries
-        scores = torch.einsum("lhqd,btlhd->blhqt", q, keys) * self.head_dim**-.5
-        return scores.softmax(-1)
-
-    def attention_weights(self, states, queries, *, layers=None):
-        keys, _, _, n = self._unpack(states)
-        if layers is not None:
-            keys = keys[:, :, list(layers)]
-        return self._reader_weights(keys, queries, n)
-
-    def features(self, states, queries, *, layers=None):
+    def features(self, states, queries):
         keys, values, token, n = self._unpack(states)
-        if layers is not None:
-            keys, values = keys[:, :, list(layers)], values[:, :, list(layers)]
         count = keys.shape[1]
         if count:
-            response = torch.einsum("blhqt,btlhd->blhqd", self._reader_weights(keys, queries, n), values).flatten(1)
+            q = rotate(queries, n) if self.rope else queries
+            scores = torch.einsum("lhqd,btlhd->blhqt", q, keys) * self.head_dim**-.5
+            response = torch.einsum("blhqt,btlhd->blhqd", scores.softmax(-1), values).flatten(1)
         else:
             response = states.new_zeros(len(states), queries.numel())
         return torch.cat([token, response], 1)
