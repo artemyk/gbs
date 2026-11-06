@@ -54,13 +54,22 @@ class CacheModel(nn.Module, ABC):
         """Return next-token log probabilities and states after observing tokens."""
 
     @abstractmethod
-    def features(self, states: Tensor, queries: Tensor) -> Tensor:
+    def features(self, states: Tensor, queries: Tensor, *, layers=None) -> Tensor:
         """Read current-token coordinates and normalized attention responses only.
 
         Queries have shape (layers, heads, queries_per_head, head_dim).
         Return shape (batch, token_features + L H Q head_dim).
         Use zeros for attention measurements of an empty cache.
+        Optional layers selects a tuple of zero-based layer indices.
         """
+
+    def value_mask(self, states: Tensor, *, layers=None) -> Tensor:
+        """Packed value coordinates, in position/layer/head/coordinate order."""
+        raise NotImplementedError("This adapter does not expose packed attention values")
+
+    def attention_weights(self, states: Tensor, queries: Tensor, *, layers=None) -> Tensor:
+        """Normalized reader weights, shaped (batch, layers, heads, queries, positions)."""
+        raise NotImplementedError("This adapter does not expose reader attention weights")
 
     def encoder_mask(self, state: Tensor) -> Tensor:
         """Writable coordinates; override to exclude structural metadata."""

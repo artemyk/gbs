@@ -78,3 +78,20 @@ def test_fractional_histories_are_rejected_before_token_conversion():
     adapter = BeliefStateAdapter(Transformer(Config()))
     with pytest.raises(ValueError, match="integer"):
         adapter.history_state(torch.tensor([[.1, 1.9]]))
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS hardware required")
+def test_inverse_encoder_forward_and_backward_on_mps():
+    from gbs import InverseEncoder
+    torch.manual_seed(5)
+    adapter = BeliefStateAdapter(Transformer(Config(vocab=2))).to('mps')
+    states = adapter.history_state(words(2, 3, device='mps'))
+    architecture = Architecture(1, 1, 4, layers=(1,))
+    decoder = AttentionDecoder(adapter, architecture).requires_grad_(False)
+    codes = decoder(adapter, states).detach()
+    base = AffineEncoder.initialize(adapter, states, codes, writable=adapter.value_mask(states, layers=(1,)))
+    inverse = InverseEncoder.from_decoder(adapter, decoder, base, steps=3, damping=1e-3)
+    probe = codes[:2].detach().requires_grad_()
+    written = inverse(probe)
+    adapter.predict(written).square().mean().backward()
+    assert bool(torch.isfinite(written).all()) and bool(torch.isfinite(probe.grad).all())

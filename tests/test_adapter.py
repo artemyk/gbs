@@ -4,7 +4,7 @@ from dataclasses import asdict
 import pytest
 import torch
 
-from gbs import BeliefStateAdapter, Architecture, AttentionDecoder, AffineEncoder, GBSAbstraction
+from gbs import BeliefStateAdapter, Architecture, AttentionDecoder, AffineEncoder, InverseEncoder, GBSAbstraction
 from gbs.adapters import CacheModel
 from reference_transformer import Config, Transformer, rotary
 from gbs.data import encode_bank, make_bank
@@ -188,3 +188,58 @@ def test_cached_natural_targets_preserve_loss_and_encoder_gradients(adapter):
         encode_bank(adapter, decoder, bank)
     with pytest.raises(ValueError, match="frozen decoder"):
         abstraction_loss(model, cached)
+
+
+def test_layer_selection_excludes_unread_cache_coordinates(adapter):
+    state = adapter.history_state(torch.randint(3, (6, 4))).requires_grad_()
+    decoder = AttentionDecoder(adapter, Architecture(2, 2, 8, layers=[1]))
+    keys, values, token, n = adapter._unpack(state)
+    changed_keys, changed_values = keys.detach().clone(), values.detach().clone()
+    changed_keys[:, :, 0] += 10
+    changed_values[:, :, 0] -= 10
+    changed = adapter._pack(changed_keys, changed_values, token.detach(), n)
+    torch.testing.assert_close(decoder(adapter, state), decoder(adapter, changed), atol=0, rtol=0)
+    gradient = torch.autograd.grad(decoder(adapter, state).sum(), state)[0]
+    width = keys.shape[1]*adapter.entry_width
+    assert torch.count_nonzero(gradient[:, :width].reshape(6, -1, 2, 2, 2, 4)[:, :, 0]) == 0
+    mask = adapter.value_mask(state, layers=(1,))
+    assert not bool(mask[width:].any())
+    packed = mask[:width].reshape(-1, 2, 2, 2, 4)
+    assert not bool(packed[:, 0].any()) and not bool(packed[:, :, :, 0].any())
+    assert bool(packed[:, 1, :, 1].all())
+
+
+def test_inverse_encoder_is_differentiable_and_serializes(adapter, tmp_path):
+    torch.manual_seed(8)
+    state = adapter.history_state(torch.randint(3, (12, 4)))
+    architecture = Architecture(2, 2, 8, layers=(1,))
+    decoder = AttentionDecoder(adapter, architecture).requires_grad_(False)
+    code = decoder(adapter, state).detach()
+    base = AffineEncoder.initialize(adapter, state, code, writable=adapter.value_mask(state, layers=(1,)))
+    with torch.no_grad():
+        base.linear.weight.zero_(); base.linear.bias.zero_()
+        probe = decoder(adapter, base.mean[None]).expand(2, -1)+.005*torch.randn(2, 2, dtype=adapter.dtype)
+    inverse = InverseEncoder.from_decoder(adapter, decoder, base, steps=5, damping=1e-6)
+    model = GBSAbstraction(adapter, decoder, inverse, architecture)
+    written = model.encode(probe)
+    torch.testing.assert_close(written[:, ~base.writable], base.mean[~base.writable].expand(2, -1), atol=0, rtol=0)
+    torch.testing.assert_close(model.decode(written), probe, atol=1e-8, rtol=1e-8)
+    assert torch.autograd.gradcheck(inverse, (probe.detach().requires_grad_(),), eps=1e-6, atol=1e-5, rtol=1e-3)
+    loss = adapter.predict(written).square().mean()
+    loss.backward()
+    assert base.linear.weight.grad.norm() > 0
+    with torch.no_grad():
+        torch.testing.assert_close(inverse(probe), written, atol=0, rtol=0)
+    path = tmp_path/'inverse.pt';model.save(path)
+    restored = GBSAbstraction.load(path, adapter)
+    assert isinstance(restored.encoder, InverseEncoder)
+    assert restored.architecture.layers == (1,)
+    torch.testing.assert_close(restored.encode(probe), written, atol=0, rtol=0)
+    assert not any(name.startswith(('adapter.', 'decoder.')) for name in inverse.state_dict())
+
+
+@pytest.mark.parametrize('layers', [(), (0, 0), (1, 0), (4,)])
+def test_invalid_layer_selections_are_rejected(layers):
+    adapter = BeliefStateAdapter(Transformer(Config()))
+    with pytest.raises(ValueError, match='layers'):
+        AttentionDecoder(adapter, Architecture(layers=layers))

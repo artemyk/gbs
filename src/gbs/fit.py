@@ -42,6 +42,7 @@ class FitConfig:
     max_outcomes: int = 65536
     allow_shared_histories: bool = False
     teacher_every: int = 1
+    layers: tuple[int, ...] | None = None
 
 
 @dataclass
@@ -209,7 +210,7 @@ def fit_abstraction(adapter: CacheModel, train_histories: Tensor, validation_his
     train = make_bank(adapter, train_histories, config.horizon, seed=config.seed+10, anchors=train_target)
     valid = make_bank(adapter, validation_histories, config.horizon, seed=config.seed+11, anchors=validation_target)
     train_states, validation_states = train.states, valid.states
-    architecture = Architecture(config.dimension, config.queries_per_head, config.hidden)
+    architecture = Architecture(config.dimension, config.queries_per_head, config.hidden, layers=config.layers)
     decoder = AttentionDecoder(adapter, architecture)
     optimizer = torch.optim.Adam(decoder.parameters(), lr=config.decoder_lr)
     trace, best, best_state = [], float("inf"), None

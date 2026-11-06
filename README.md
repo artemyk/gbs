@@ -288,6 +288,47 @@ To retain intermediate refinement results, pass a new `checkpoint_directory`
 to `refine_encoder`. It saves the starting abstraction and each
 validation-selected improvement, with its configuration and validation trace.
 
+## Selected layers and an inverse encoder
+
+Set `FitConfig(layers=(2, 3))` to fit a decoder using zero-based layers 2 and 3.
+The current-token coordinates remain part of its input. All layers are used by
+default. A selected-layer `Architecture` is retained in abstraction checkpoints.
+
+For a known, frozen decoder, an alternative to a purely affine writer is a
+value-only affine writer followed by differentiable inverse corrections:
+
+```python
+from gbs import AffineEncoder, InverseEncoder
+
+model.decoder.requires_grad_(False)
+states = model.adapter.history_state(train.to(model.adapter.device))
+codes = model.decode(states).detach()
+mask = model.adapter.value_mask(states, layers=model.architecture.layers)
+base = AffineEncoder.initialize(model.adapter, states, codes, writable=mask)
+model.encoder = InverseEncoder.from_decoder(
+    model.adapter, model.decoder, base, steps=12, damping=1e-3,
+)
+```
+
+Unwritten coordinates are fixed to their training means, including keys and
+current-token coordinates. The inverse stores normalized attention weights and
+MLP factors from the frozen decoder. It applies damped Gauss--Newton corrections
+to values, solving a code-sized system at each iteration. The operations are
+differentiable through both the input code and the base writer's parameters;
+the base writer can therefore be optimized with prediction and tracking losses.
+Rebuild the inverse whenever the decoder or fixed reference state changes.
+
+This encoder generally changes the state nonlinearly. It can substantially
+reduce round-trip error, while prediction and trajectory preservation still
+require independent measurement. Solver steps and damping trade execution cost
+against convergence. For inverse encoders with nearly zero round-trip error,
+selecting predictive fits by the full validation objective is more informative
+than selecting numerical fluctuations of round-trip MSE.
+
+The supplied belief-state adapter exposes `value_mask` and `attention_weights`
+for this construction. Other adapters can implement the same optional methods;
+value-mask ordering is position, selected layer, head, then value coordinate.
+
 ## Other transformers and initializations
 
 The fitting code depends on `CacheModel`, not a particular transformer class.
