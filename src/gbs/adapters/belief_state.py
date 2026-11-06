@@ -156,9 +156,6 @@ class BeliefStateAdapter(CacheModel):
             q = rotate(queries, n) if self.rope else queries
             scores = torch.einsum("lhqd,btlhd->blhqt", q, keys) * self.head_dim**-.5
             response = torch.einsum("blhqt,btlhd->blhqd", scores.softmax(-1), values).flatten(1)
-            mass = F.softplus(scores.logsumexp(-1)).flatten(1)
         else:
             response = states.new_zeros(len(states), queries.numel())
-            mass = states.new_zeros(len(states), queries.numel()//self.head_dim)
-        log_count = states.new_full((len(states), 1), float(torch.log1p(torch.tensor(count, dtype=torch.float64))))
-        return torch.cat([token, response, mass, log_count], 1)
+        return torch.cat([token, response], 1)

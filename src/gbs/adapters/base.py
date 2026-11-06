@@ -55,10 +55,10 @@ class CacheModel(nn.Module, ABC):
 
     @abstractmethod
     def features(self, states: Tensor, queries: Tensor) -> Tensor:
-        """Read token, attention responses, log(1+Z), and log(1+cache size).
+        """Read current-token coordinates and normalized attention responses only.
 
         Queries have shape (layers, heads, queries_per_head, head_dim).
-        Return shape (batch, token_features + L H Q (head_dim+1) + 1).
+        Return shape (batch, token_features + L H Q head_dim).
         Use zeros for attention measurements of an empty cache.
         """
 

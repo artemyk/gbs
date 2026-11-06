@@ -36,7 +36,7 @@ def test_native_predictions_cache_states_and_context_bounds(adapter):
     with pytest.raises(ValueError, match="context"): adapter.predict(state)
 
 
-def test_intervention_gradients_and_true_attention_sums(adapter):
+def test_intervention_gradients_and_normalized_decoder_inputs(adapter):
     h = torch.tensor([[0, 1, 2, 1], [2, 1, 0, 2]])
     state = adapter.history_state(h).requires_grad_(True)
     continuation = torch.tensor([[2, 1, 0], [0, 2, 1]])
@@ -54,9 +54,17 @@ def test_intervention_gradients_and_true_attention_sums(adapter):
     z = weights.sum(-1)
     numerator = torch.einsum("blhqt,btlhd->blhqd", weights, values)
     response = features[:, 4:36].reshape(2, 2, 2, 2, 4)
-    recovered_z = features[:, 36:44].expm1().reshape(2, 2, 2, 2)
-    torch.testing.assert_close(recovered_z, z)
-    torch.testing.assert_close(response*recovered_z[..., None], numerator)
+    assert features.shape == (2, adapter.token_features+q.numel())
+    torch.testing.assert_close(features[:, :4], state.detach()[:, -5:-1])
+    torch.testing.assert_close(response, numerator/z[..., None])
+    # A common key shift changes each denominator but cancels in softmax.
+    shifted = adapter._pack(keys+0.7, values, state.detach()[:, -5:-1], n)
+    torch.testing.assert_close(adapter.features(shifted, q), features)
+    empty = adapter.history_state(h[:, :0])
+    empty_features = adapter.features(empty, q)
+    assert empty_features.shape == features.shape
+    torch.testing.assert_close(empty_features[:, :4], empty[:, :4])
+    assert torch.count_nonzero(empty_features[:, 4:]) == 0
 
 
 def test_encoder_fixed_coordinates_and_checkpoint_roundtrip(adapter, tmp_path):
@@ -83,6 +91,12 @@ def test_encoder_fixed_coordinates_and_checkpoint_roundtrip(adapter, tmp_path):
     torch.testing.assert_close(restored.decode(written), model.decode(written), atol=0, rtol=0)
     torch.testing.assert_close(restored.encode(codes), model.encode(codes), atol=0, rtol=0)
     with pytest.raises(FileExistsError): model.save(path)
+    obsolete = torch.load(path, weights_only=True)
+    obsolete["format_version"] = 1
+    old_path = tmp_path/"obsolete.pt"
+    torch.save(obsolete, old_path)
+    with pytest.raises(ValueError, match="normalized-attention decoder inputs"):
+        GBSAbstraction.load(old_path, adapter)
     with torch.no_grad(): adapter.model.unembed.bias.add_(.01)
     with pytest.raises(ValueError, match="match"): GBSAbstraction.load(path, adapter)
 

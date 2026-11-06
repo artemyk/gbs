@@ -33,7 +33,7 @@ class CoinMixture(CacheModel):
     def features(self, states, queries):
         z = states[:, :1]
         response = z.expand(-1, queries.numel())
-        return torch.cat([z, response, response.new_full(response.shape, .6931471805599453), z.new_full(z.shape, .6931471805599453)], 1)
+        return torch.cat([z, response], 1)
 
     def encoder_mask(self, states):
         return torch.tensor([True, False])

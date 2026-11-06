@@ -25,7 +25,7 @@ class AttentionDecoder(nn.Module):
             raise ValueError("Decoder dimensions must be positive")
         self.queries = nn.Parameter(torch.randn(adapter.n_layers, adapter.n_heads, a.queries_per_head, adapter.head_dim,
                                                 device=adapter.device, dtype=adapter.dtype))
-        inputs = adapter.token_features + adapter.n_layers*adapter.n_heads*a.queries_per_head*(adapter.head_dim+1) + 1
+        inputs = adapter.token_features + adapter.n_layers*adapter.n_heads*a.queries_per_head*adapter.head_dim
         self.net = nn.Sequential(nn.Linear(inputs, a.hidden), nn.Tanh(), nn.Linear(a.hidden, a.dimension)).to(
             device=adapter.device, dtype=adapter.dtype)
 
@@ -101,14 +101,16 @@ class GBSAbstraction(nn.Module):
         path = Path(path)
         if path.exists():
             raise FileExistsError(path)
-        torch.save(dict(format_version=1, architecture=asdict(self.architecture),
+        torch.save(dict(format_version=2, architecture=asdict(self.architecture),
                         teacher_fingerprint=self.adapter.fingerprint(), adapter_spec=self.adapter.spec(),
                         decoder=self.decoder.state_dict(), encoder=self.encoder.state_dict()), path)
 
     @classmethod
     def load(cls, path, adapter):
         saved = torch.load(path, map_location=adapter.device, weights_only=True)
-        if saved["format_version"] != 1 or saved["teacher_fingerprint"] != adapter.fingerprint():
+        if saved["format_version"] != 2:
+            raise ValueError("Unsupported abstraction format; refit using normalized-attention decoder inputs")
+        if saved["teacher_fingerprint"] != adapter.fingerprint():
             raise ValueError("The abstraction does not match this teacher/adapter")
         architecture = Architecture(**saved["architecture"])
         decoder = AttentionDecoder(adapter, architecture)

@@ -185,8 +185,7 @@ BOS. `advance` implements write, transformer update, then decode.
 2. **Fit the decoder.** Whiten GHMM coordinates using training histories and
    regress them from attention measurements of natural transformer states.
    The decoder learns queries for every layer and head. It reads normalized
-   attention responses, `log(1 + Z)` for attention denominators, the cache size,
-   and current-token coordinates, followed by a tanh MLP.
+   attention responses and current-token coordinates, followed by a tanh MLP.
 3. **Initialize and fit the encoder.** An affine map writes a representative
    cache and relaxed token. Initialize it by least squares against natural
    states, then fit with the decoder fixed.
