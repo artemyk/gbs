@@ -265,12 +265,15 @@ def evaluate(model, histories, *, horizon=16, seed=DEFAULT_EVALUATION_SEED):
     return _evaluate_bank(model, bank)
 
 
-def refine_encoder(model, train_histories, validation_histories, *, config=None, progress=print):
+def refine_encoder(model, train_histories, validation_histories, *, config=None, progress=print,
+                   checkpoint_directory=None):
     """Improve round trips with decoder and teacher fixed and validation-only limits.
 
     This starts fresh Adam and samples new continuation banks. The starting
     encoder is always an eligible checkpoint. Existing model weights are
     updated in place; save the original abstraction first to retain it.
+    If checkpoint_directory is supplied, create a new directory and save each
+    validation-selected best abstraction there, including the starting model.
     """
     config = config or RefineConfig()
     _validate_config(config)
@@ -292,13 +295,22 @@ def refine_encoder(model, train_histories, validation_histories, *, config=None,
     optimizer = torch.optim.Adam(model.encoder.parameters(), lr=config.lr)
     rng = np.random.default_rng(config.seed)
     trace, best, best_state = [], starting["roundtrip_mse"]["mean"], _interface_state(model)
+    if checkpoint_directory is not None:
+        checkpoint_directory = Path(checkpoint_directory)
+        checkpoint_directory.mkdir(parents=True, exist_ok=False)
     for step in range(config.steps+1):
         if step % config.validate_every == 0 or step == config.steps:
             measured = starting if step == 0 else _evaluate_bank(model, valid)
             feasible = all(measured[key]["mean"] <= value+tolerances[key] for key, value in limits.items())
             trace.append(dict(stage="refine", step=step, feasible=feasible, metrics=measured))
-            if feasible and measured["roundtrip_mse"]["mean"] < best:
+            improved = feasible and measured["roundtrip_mse"]["mean"] < best
+            if improved:
                 best, best_state = measured["roundtrip_mse"]["mean"], _interface_state(model)
+            if checkpoint_directory is not None and (step == 0 or improved):
+                model.save(checkpoint_directory/f"step-{step:06d}.pt")
+                (checkpoint_directory/f"step-{step:06d}.json").write_text(json.dumps(dict(
+                    trace=trace, config=asdict(config), validation_limits=limits,
+                    validation_tolerances=tolerances), indent=2)+"\n")
             if progress: progress(f"refine {step}/{config.steps}: round-trip MSE {measured['roundtrip_mse']['mean']:.6g}; feasible={feasible}")
         if step == config.steps: break
         optimizer.param_groups[0]["lr"] = config.lr*(.1+.45*(1+np.cos(np.pi*step/config.steps)))

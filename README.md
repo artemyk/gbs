@@ -254,6 +254,10 @@ tiny negative roundoff values. Limits and allowances are recorded in
 Refinement starts fresh Adam and new fixed continuation banks; it does not
 resume optimizer state. The demo's `--refine-steps` option runs this workflow.
 
+To retain intermediate refinement results, pass a new `checkpoint_directory`
+to `refine_encoder`. It saves the starting abstraction and each
+validation-selected improvement, with its configuration and validation trace.
+
 ## Other transformers and initializations
 
 The fitting code depends on `CacheModel`, not a particular transformer class.

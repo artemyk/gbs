@@ -55,9 +55,20 @@ def test_full_fit_refinement_and_safe_serialization(tmp_path):
     torch.testing.assert_close(restored.encode(torch.tensor([[.1]], dtype=torch.float64)), result.abstraction.encode(torch.tensor([[.1]], dtype=torch.float64)))
     before = copy.deepcopy(restored.decoder.state_dict())
     refined = refine_encoder(restored, train, valid,
-        config=RefineConfig(steps=2, horizon=3, batch_size=8, validate_every=1), progress=None)
+        config=RefineConfig(steps=2, horizon=3, batch_size=8, validate_every=1), progress=None,
+        checkpoint_directory=tmp_path/"encoder-checkpoints")
     assert all(torch.equal(v, restored.decoder.state_dict()[k]) for k, v in before.items())
     assert any(v["feasible"] for v in refined.trace)
+    starting_checkpoint = GBSAbstraction.load(tmp_path/"encoder-checkpoints/step-000000.pt", adapter)
+    assert all(torch.equal(v, starting_checkpoint.decoder.state_dict()[k]) for k, v in before.items())
+    checkpoints = sorted((tmp_path/"encoder-checkpoints").glob("*.pt"))
+    assert len(checkpoints) >= 1
+    for checkpoint in checkpoints:
+        assert checkpoint.with_suffix(".json").is_file()
+        GBSAbstraction.load(checkpoint, adapter)
+    latest = GBSAbstraction.load(checkpoints[-1], adapter)
+    assert all(torch.equal(v, latest.encoder.state_dict()[k])
+               for k, v in restored.encoder.state_dict().items())
     metrics = evaluate(restored, valid, horizon=3, seed=131)
     assert all(torch.isfinite(torch.tensor(v["mean"])) for v in metrics.values())
     with pytest.raises(ValueError, match="overlap"):
