@@ -1,4 +1,5 @@
 from dataclasses import asdict
+import itertools
 import hashlib
 import json
 
@@ -11,10 +12,11 @@ from gbs.cli import main
 from reference_transformer import Config, Transformer
 
 
-@pytest.fixture(params=[{}, {"attention_mass": True}, {"attention_sums": True}], ids=["standard", "log_z", "raw_sums"])
+@pytest.fixture(params=list(itertools.product([False, True], [False, True])))
 def inputs(request, tmp_path):
     torch.manual_seed(5)
-    teacher = Transformer(Config(bos_visible=True, **request.param))
+    rope, bos_visible = request.param
+    teacher = Transformer(Config(rope=rope, bos_visible=bos_visible))
     checkpoint = tmp_path/"teacher.pt"
     torch.save(dict(config=asdict(teacher.cfg), model=teacher.state_dict()), checkpoint)
     roots = words(teacher.cfg.vocab, 3).to(torch.uint8)

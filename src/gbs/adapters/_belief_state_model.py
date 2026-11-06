@@ -1,7 +1,7 @@
 """Checkpoint architecture from artemyk/belief-state (MIT, Artemy Kolchinsky).
 
-The parameter names match upstream state dictionaries. This inference model
-also supports the visible-BOS, log-Z, and raw-(N,Z) attention configurations.
+The parameter names match upstream state dictionaries. Attention is standard
+softmax attention, with RoPE or learned positions and optional visible BOS.
 """
 from dataclasses import dataclass
 
@@ -20,16 +20,12 @@ class Config:
     d_head: int = 8
     d_mlp: int = 256
     rope: bool = False
-    attention_mass: bool = False
-    attention_sums: bool = False
     bos_visible: bool = False
 
     def __post_init__(self):
         dimensions = [self.vocab, self.context, self.d_model, self.n_layers, self.n_heads, self.d_head, self.d_mlp]
         if min(dimensions) < 1 or (self.rope and self.d_head % 2):
             raise ValueError("Positive model dimensions and an even RoPE head dimension are required")
-        if self.attention_sums and self.attention_mass:
-            raise ValueError("Choose either normalized attention with log Z or raw numerator and denominator")
 
 
 def rotate(x, positions):
@@ -45,33 +41,17 @@ def rotate(x, positions):
 
 def attention_projection(block, q, k, v, mask):
     """The teacher's attention projection, shared by native and cached execution."""
-    mass_weight = getattr(block, "mass_weight", None)
-    if mass_weight is None:
-        response = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
-        denominator = None
-    else:
-        scores = (q @ k.transpose(-2, -1))*q.shape[-1]**-.5
-        scores = scores.masked_fill(~mask, float('-inf'))
-        if getattr(block, "attention_sums", False):
-            weights = scores.exp()
-            response, denominator = weights @ v, weights.sum(-1)
-        else:
-            response, denominator = scores.softmax(-1) @ v, scores.logsumexp(-1)
-    projected = block.out(response.transpose(1, 2).flatten(2))
-    if denominator is not None:
-        projected = projected+F.linear(denominator.transpose(1, 2), mass_weight)
-    return projected
+    response = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+    return block.out(response.transpose(1, 2).flatten(2))
 
 
 class Block(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.n_heads, self.d_head, self.rope = cfg.n_heads, cfg.d_head, cfg.rope
-        self.attention_sums = cfg.attention_sums
         self.ln1 = nn.LayerNorm(cfg.d_model)
         self.qkv = nn.Linear(cfg.d_model, 3*cfg.n_heads*cfg.d_head)
         self.out = nn.Linear(cfg.n_heads*cfg.d_head, cfg.d_model)
-        self.mass_weight = nn.Parameter(torch.zeros(cfg.d_model, cfg.n_heads)) if cfg.attention_mass or cfg.attention_sums else None
         self.ln2 = nn.LayerNorm(cfg.d_model)
         self.mlp = nn.Sequential(nn.Linear(cfg.d_model, cfg.d_mlp), nn.ReLU(), nn.Linear(cfg.d_mlp, cfg.d_model))
 

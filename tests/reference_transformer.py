@@ -16,8 +16,6 @@ class Config:
     d_mlp: int = 24
     rope: bool = True
     bos_visible: bool = False
-    attention_mass: bool = False
-    attention_sums: bool = False
 
 
 def rotary(x, positions):
@@ -34,8 +32,6 @@ class Block(nn.Module):
         self.ln1 = nn.LayerNorm(cfg.d_model)
         self.qkv = nn.Linear(cfg.d_model, 3*cfg.n_heads*cfg.d_head)
         self.out = nn.Linear(cfg.n_heads*cfg.d_head, cfg.d_model)
-        self.mass_weight = nn.Parameter(.03*torch.randn(cfg.d_model, cfg.n_heads)) if cfg.attention_mass or cfg.attention_sums else None
-        self.attention_sums = cfg.attention_sums
         self.ln2 = nn.LayerNorm(cfg.d_model)
         self.mlp = nn.Sequential(nn.Linear(cfg.d_model, cfg.d_mlp), nn.ReLU(), nn.Linear(cfg.d_mlp, cfg.d_model))
 
@@ -64,14 +60,7 @@ class Transformer(nn.Module):
             if cfg.rope: q, k = rotary(q, pos), rotary(k, pos)
             score = (q @ k.transpose(-2, -1))/cfg.d_head**.5
             score = score.masked_fill(~mask, -torch.inf)
-            if cfg.attention_sums:
-                mass = score.exp().sum(-1)
-                result = score.exp() @ v
-            else:
-                result = score.softmax(-1) @ v
-                mass = score.logsumexp(-1)
+            result = score.softmax(-1) @ v
             x = x+block.out(result.transpose(1, 2).reshape(len(x), n, -1))
-            if block.mass_weight is not None:
-                x = x+mass.transpose(1, 2) @ block.mass_weight.T
             x = x+block.mlp(block.ln2(x))
         return self.unembed(self.ln_final(x))

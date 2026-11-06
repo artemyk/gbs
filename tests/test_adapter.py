@@ -9,12 +9,11 @@ from gbs.adapters import CacheModel
 from reference_transformer import Config, Transformer, rotary
 
 
-@pytest.fixture(params=list(itertools.product([False, True], [False, True], ["standard", "log", "raw"])))
+@pytest.fixture(params=list(itertools.product([False, True], [False, True])))
 def adapter(request):
-    rope, bos, mode = request.param
+    rope, bos = request.param
     torch.manual_seed(42)
-    return BeliefStateAdapter(Transformer(Config(rope=rope, bos_visible=bos,
-        attention_mass=mode=="log", attention_sums=mode=="raw")).double())
+    return BeliefStateAdapter(Transformer(Config(rope=rope, bos_visible=bos)).double())
 
 
 def test_native_predictions_cache_states_and_context_bounds(adapter):
@@ -103,7 +102,9 @@ def test_encoder_fixed_coordinates_and_checkpoint_roundtrip(adapter, tmp_path):
 
 def test_checkpoint_load_without_source_preserves_predictions_and_dtype(adapter, tmp_path):
     path = tmp_path/"teacher.pt"
-    torch.save(dict(config=asdict(adapter.model.cfg), model=adapter.model.state_dict()), path)
+    # Inactive experimental flags appear in some standard upstream checkpoints.
+    config = dict(asdict(adapter.model.cfg), attention_mass=False, attention_sums=False)
+    torch.save(dict(config=config, model=adapter.model.state_dict()), path)
     loaded = BeliefStateAdapter.from_checkpoint(path)
     assert loaded.dtype == adapter.dtype
     assert loaded.fingerprint() == adapter.fingerprint()
@@ -126,3 +127,11 @@ def test_checkpoint_rejects_missing_or_mismatched_architecture(tmp_path):
     torch.save(dict(config=dict(config, d_model=32), model=model.state_dict()), path)
     with pytest.raises(RuntimeError, match="size mismatch"):
         BeliefStateAdapter.from_checkpoint(path)
+    for name in ("attention_mass", "attention_sums"):
+        torch.save(dict(config=dict(config, **{name: True}), model=model.state_dict()), path)
+        with pytest.raises(ValueError, match="Only standard softmax attention"):
+            BeliefStateAdapter.from_checkpoint(path)
+        setattr(model.cfg, name, True)
+        with pytest.raises(ValueError, match="Only standard softmax attention"):
+            BeliefStateAdapter(model)
+        delattr(model.cfg, name)

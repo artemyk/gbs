@@ -21,8 +21,10 @@ class BeliefStateAdapter(CacheModel):
     """
     def __init__(self, model):
         super().__init__()
-        self.model = model.eval().requires_grad_(False)
         cfg = model.cfg
+        if any(getattr(cfg, name, False) for name in ("attention_mass", "attention_sums")):
+            raise ValueError("Only standard softmax attention is supported")
+        self.model = model.eval().requires_grad_(False)
         self.vocab_size, self.n_layers = cfg.vocab, cfg.n_layers
         self.n_heads, self.head_dim = cfg.n_heads, cfg.d_head
         self.token_features = cfg.vocab + 1
@@ -44,7 +46,12 @@ class BeliefStateAdapter(CacheModel):
         saved = torch.load(checkpoint, map_location="cpu", weights_only=True)
         if not isinstance(saved, dict) or not {"config", "model"} <= saved.keys():
             raise ValueError("Expected a belief-state checkpoint with config and model state dictionary")
-        model = Transformer(Config(**saved["config"]))
+        config = dict(saved["config"])
+        # Standard upstream checkpoints can contain inactive experimental flags.
+        for name in ("attention_mass", "attention_sums"):
+            if config.pop(name, False):
+                raise ValueError("Only standard softmax attention is supported")
+        model = Transformer(Config(**config))
         model.to(dtype=saved["model"]["embed.weight"].dtype)
         model.load_state_dict(saved["model"])
         return cls(model).to(device)
@@ -55,6 +62,7 @@ class BeliefStateAdapter(CacheModel):
         return self
 
     def spec(self):
+        # Keep standard-teacher identity stable for saved abstraction checkpoints.
         config = dict(attention_mass=False, attention_sums=False, bos_visible=False)
         config.update(asdict(self.model.cfg))
         return dict(**super().spec(), layout="kv-token-length-v1", config=config)

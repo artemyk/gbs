@@ -49,8 +49,8 @@ pinned to upstream commit `61c2a5570ce7df8ca5a739b2ecc0a27716cea5c4`, and verifi
 its SHA-256 checksum. It caches the file at
 `checkpoints/L4_d64_rope_eps0.05_s0.pt`; subsequent runs reuse the verified file.
 No source checkout is needed. Use `--checkpoint path/to/model.pt` for a local
-checkpoint. The adapter also supports visible-BOS, log-normalizer, raw
-numerator/denominator, learned-position, and multi-head configurations.
+checkpoint. The adapter supports standard softmax attention with RoPE or learned
+positions, optional visible BOS, and multiple heads.
 
 ### Checkpoint format
 
