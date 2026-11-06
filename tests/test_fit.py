@@ -43,7 +43,7 @@ def test_full_fit_refinement_and_safe_serialization(tmp_path):
     adapter = CoinMixture()
     histories = words(2, 5)
     train, valid = histories[::2], histories[1::2]
-    config = FitConfig(dimension=1, queries_per_head=2, hidden=8, horizon=3, future_length=2,
+    config = FitConfig(encoder_refine_steps=0, joint_refine_steps=0, dimension=1, queries_per_head=2, hidden=8, horizon=3, future_length=2,
                        spectral_samples=32, decoder_steps=100, encoder_steps=10, joint_steps=10,
                        batch_size=8, validate_every=10, seed=41)
     result = fit_abstraction(adapter, train, valid, config=config, progress=None)
@@ -79,7 +79,7 @@ def test_repeated_compression_kl_matches_exact_joint_kl():
     adapter = CoinMixture()
     histories = words(2, 4)
     result = fit_abstraction(adapter, histories[::2], histories[1::2],
-        config=FitConfig(dimension=1, queries_per_head=1, hidden=4, horizon=3, future_length=2,
+        config=FitConfig(encoder_refine_steps=0, joint_refine_steps=0, dimension=1, queries_per_head=1, hidden=4, horizon=3, future_length=2,
                          spectral_samples=20, decoder_steps=2, encoder_steps=0, joint_steps=0,
                          batch_size=4, validate_every=1), progress=None)
     model = result.abstraction
@@ -112,7 +112,7 @@ def test_fitting_prepares_root_and_prefix_caches_in_bounded_batches():
     adapter = CountingTeacher()
     histories = words(2, 10)
     fit_abstraction(adapter, histories[:512], histories[512:],
-        initializer=lambda h: h.double().sum(1, keepdim=True), config=FitConfig(
+        initializer=lambda h: h.double().sum(1, keepdim=True), config=FitConfig(encoder_refine_steps=0, joint_refine_steps=0,
             dimension=1, queries_per_head=1, hidden=4, horizon=2,
             decoder_steps=0, encoder_steps=0, joint_steps=0), progress=None)
     # Root banks, one randomly assigned prefix per training parent, and a
@@ -125,7 +125,7 @@ def test_fitting_prepares_root_and_prefix_caches_in_bounded_batches():
 def test_loss_and_gradients_match_an_independent_sequential_rollout():
     adapter = CoinMixture()
     histories = words(2, 4)
-    result = fit_abstraction(adapter, histories[::2], histories[1::2], config=FitConfig(
+    result = fit_abstraction(adapter, histories[::2], histories[1::2], config=FitConfig(encoder_refine_steps=0, joint_refine_steps=0,
         dimension=1, queries_per_head=1, hidden=4, horizon=3, future_length=2,
         spectral_samples=20, decoder_steps=2, encoder_steps=0, joint_steps=0), progress=None)
     model = result.abstraction
@@ -165,7 +165,7 @@ def test_alternating_refinement_checks_full_metrics_and_keeps_a_safe_fallback(fo
     import gbs.fit as fitting
     adapter = CoinMixture()
     histories = words(2, 4)
-    model = fit_abstraction(adapter, histories[::2], histories[1::2], config=FitConfig(
+    model = fit_abstraction(adapter, histories[::2], histories[1::2], config=FitConfig(encoder_refine_steps=0, joint_refine_steps=0,
         dimension=1, queries_per_head=1, hidden=4, horizon=2, future_length=2,
         spectral_samples=20, decoder_steps=2, encoder_steps=0, joint_steps=0), progress=None).abstraction
     original = copy.deepcopy(model.encoder.state_dict())
@@ -258,7 +258,7 @@ def test_decoder_learning_rate_schedule_reaches_the_optimizer(steps, fraction, m
     monkeypatch.setattr(torch.optim.Adam, "step", recorded)
     histories = words(2, 4)
     result = fit_abstraction(CoinMixture(), histories[::2], histories[1::2],
-        initializer=lambda h: h.double().sum(1, keepdim=True), config=FitConfig(
+        initializer=lambda h: h.double().sum(1, keepdim=True), config=FitConfig(encoder_refine_steps=0, joint_refine_steps=0,
             dimension=1, queries_per_head=1, hidden=4, horizon=2,
             decoder_steps=steps, encoder_steps=0, joint_steps=0,
             decoder_min_lr_fraction=fraction), progress=None)
@@ -276,4 +276,73 @@ def test_decoder_learning_rate_schedule_reaches_the_optimizer(steps, fraction, m
 @pytest.mark.parametrize("fraction", [0, -.1, 1.1, float("nan")])
 def test_invalid_decoder_learning_rate_fractions_are_rejected(fraction):
     with pytest.raises(ValueError, match="decoder_min_lr_fraction"):
-        fit_abstraction(None, None, None, config=FitConfig(decoder_min_lr_fraction=fraction), progress=None)
+        fit_abstraction(None, None, None, config=FitConfig(encoder_refine_steps=0, joint_refine_steps=0, decoder_min_lr_fraction=fraction), progress=None)
+
+
+def test_complete_fit_reuses_continuations_and_refreshes_codes_after_joint_fitting(monkeypatch, tmp_path):
+    import gbs.fit as fitting
+    adapter = CoinMixture()
+    histories = words(2, 5)
+    train, valid = histories[::2], histories[1::2]
+    prepare, refine = fitting.make_bank, fitting._refine_encoder
+    prepared, refinements = [], []
+
+    def bank(*args, **kwargs):
+        result = prepare(*args, **kwargs)
+        prepared.append(result)
+        return result
+
+    def checked_refinement(model, training, validation, config, **kwargs):
+        # Independently decode the natural trajectories with the CURRENT
+        # decoder. Reusing pre-joint codes would violate these assertions.
+        for roots, cached in [(train, training), (valid, validation)]:
+            with torch.no_grad():
+                states = adapter.history_state(roots)
+                _, successors = adapter.trajectory(states, cached.tokens)
+                torch.testing.assert_close(cached.codes, model.decode(states))
+                torch.testing.assert_close(cached.targets,
+                    torch.stack([model.decode(state) for state in successors], 1))
+        refinements.append(dict(codes=training.codes.clone(), tokens=training.tokens,
+            decoder=copy.deepcopy(model.decoder.state_dict())))
+        return refine(model, training, validation, config, **kwargs)
+
+    monkeypatch.setattr(fitting, "make_bank", bank)
+    monkeypatch.setattr(fitting, "_refine_encoder", checked_refinement)
+    config = FitConfig(dimension=1, queries_per_head=1, hidden=8, horizon=2,
+        decoder_steps=15, encoder_steps=6, encoder_refine_steps=4,
+        joint_steps=20, joint_refine_steps=4, joint_decoder_lr=.01,
+        teacher_every=3, batch_size=8, validate_every=2, seed=41)
+    result = fit_abstraction(adapter, train, valid, config=config,
+        initializer=lambda h: adapter.history_state(h)[:, :1], progress=None)
+    assert len(prepared) == 2  # No new continuations during either refinement.
+    assert len(refinements) == 2
+    assert all(row["tokens"] is prepared[0].tokens for row in refinements)
+    assert any(not torch.equal(value, refinements[1]["decoder"][key])
+               for key, value in refinements[0]["decoder"].items())
+    assert not torch.equal(refinements[0]["codes"], refinements[1]["codes"])
+    assert set(row["stage"] for row in result.trace) == {
+        "decoder", "encoder", "encoder_refine", "joint", "joint_refine"}
+    assert result.initialization["encoder"]["teacher_steps"] == 2
+    assert result.initialization["encoder"]["roundtrip_steps"] == 4
+    assert result.initialization["joint"]["teacher_steps"] == 20
+    for stage in ["encoder_refine", "joint_refine"]:
+        record = result.initialization[stage]
+        selected = next(row for row in result.trace
+                        if row["stage"] == stage and row["step"] == record["selected_step"])
+        assert record["teacher_steps"] == record["roundtrip_steps"] == 2
+        assert selected["feasible"]
+        for metric, limit in record["validation_limits"].items():
+            assert selected["metrics"][metric]["mean"] <= limit+record["validation_tolerances"][metric]
+    result.save(tmp_path/"complete")
+    loaded = GBSAbstraction.load(tmp_path/"complete/abstraction.pt", adapter)
+    for key, value in result.abstraction.state_dict().items():
+        torch.testing.assert_close(value, loaded.state_dict()[key])
+
+
+@pytest.mark.parametrize("config", [FitConfig(preservation_slack=-.1), RefineConfig(preservation_slack=float("nan"))])
+def test_invalid_preservation_slack_is_rejected_before_preparing_data(config):
+    with pytest.raises(ValueError, match="preservation_slack"):
+        if isinstance(config, FitConfig):
+            fit_abstraction(None, None, None, config=config, progress=None)
+        else:
+            refine_encoder(None, None, None, config=config, progress=None)

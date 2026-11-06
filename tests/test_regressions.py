@@ -47,7 +47,7 @@ def test_default_ghmm_fitting_accepts_all_supported_integer_history_types(dtype)
     torch.manual_seed(5)
     adapter = BeliefStateAdapter(Transformer(Config(bos_visible=True)))
     histories = words(3, 3).to(dtype)
-    result = fit_abstraction(adapter, histories[:12], histories[12:20], config=FitConfig(
+    result = fit_abstraction(adapter, histories[:12], histories[12:20], config=FitConfig(encoder_refine_steps=0, joint_refine_steps=0,
         dimension=1, queries_per_head=1, hidden=4, horizon=2, future_length=1,
         spectral_samples=16, decoder_steps=0, encoder_steps=0, joint_steps=0,
         batch_size=2, validate_every=1, seed=10), progress=None)
@@ -62,7 +62,7 @@ def test_cpu_double_ghmm_initializes_an_mps_teacher():
                        torch.tensor([1., .5], dtype=torch.float64))
     histories = words(2, 4)
     result = fit_abstraction(adapter, histories[::2], histories[1::2], initializer=initializer,
-        config=FitConfig(dimension=1, queries_per_head=1, hidden=4, horizon=2,
+        config=FitConfig(encoder_refine_steps=0, joint_refine_steps=0, dimension=1, queries_per_head=1, hidden=4, horizon=2,
                          decoder_steps=0, encoder_steps=0, joint_steps=0), progress=None)
     assert initializer.initial.device.type == "cpu" and initializer.initial.dtype == torch.float64
     assert result.abstraction.encoder.mean.device.type == "mps"

@@ -49,8 +49,9 @@ pinned to upstream commit `61c2a5570ce7df8ca5a739b2ecc0a27716cea5c4`, and verifi
 its SHA-256 checksum. It caches the file at
 `checkpoints/L4_d64_rope_eps0.05_s0.pt`; subsequent runs reuse the verified file.
 No source checkout is needed. Use `--checkpoint path/to/model.pt` for a local
-checkpoint. The adapter supports standard softmax attention with RoPE or learned
-positions, optional visible BOS, and multiple heads.
+checkpoint, including a visible-BOS RoPE model. The adapter supports standard
+softmax attention with RoPE or learned positions, optional visible BOS, and
+multiple heads.
 
 ### Checkpoint format
 
@@ -98,7 +99,9 @@ The demo and CLI use the same artifact writer. Both default to evaluation seed
 Refinement writes a complete record in the `refined/` subdirectory, including
 its history splits and the starting abstraction's hash.
 
-The quick run checks the workflow; it is not a converged fit. No convergence or
+The default fit includes both encoder refinement stages and joint fine-tuning;
+no separate refinement command is needed. The quick run exercises these same
+stages with small budgets; it is not a converged fit. No convergence or
 prediction-accuracy threshold is assumed by the fitter.
 
 ## Shared experiment commands
@@ -176,12 +179,62 @@ BOS. `advance` implements write, transformer update, then decode.
 
 ## Fitting procedure
 
-Decoder regression uses `FitConfig.decoder_lr`. Set `decoder_min_lr_fraction`
-below 1 to apply cosine decay toward that fraction of the initial learning
-rate. Its default of 1 keeps the learning rate constant. For example,
-`decoder_lr=0.001, decoder_min_lr_fraction=0.01` decays toward 0.00001.
-`queries_per_head`, `hidden`, and `decoder_steps` control decoder capacity and
-training budget. Decoder checkpoints are selected by validation coordinate MSE.
+`fit_abstraction` runs the complete procedure used for the final decoder/encoder
+fit:
+
+1. **Fit a GHMM.** Query the teacher's joint probabilities of short futures.
+   Center their vectors, retain the leading singular directions, and fit one
+   observable operator per token by least squares on joint successor vectors.
+   An explicit constant coordinate enforces normalization. A four-dimensional
+   abstraction starts with a five-dimensional GHMM. Its initial state is
+   obtained from a separate empty-history query.
+2. **Fit one decoder across positions.** Drop the GHMM's constant coordinate,
+   whiten the remaining coordinates using training roots, and reuse that
+   transform at every prefix length. Regress these coordinates from normalized
+   attention responses and current-token coordinates. Initialize queries
+   randomly and optimize them together with the readout. Select by validation
+   coordinate MSE.
+3. **Initialize and fit the encoder.** Initialize an affine map by least squares
+   from whitened GHMM coordinates to natural transformer states. With the
+   decoder fixed, cache its natural root and successor codes, then alternate
+   cheap round-trip updates with full prediction/tracking updates. Select by
+   the full validation objective.
+4. **Refine the encoder.** Keep the decoder fixed and select the smallest
+   validation round-trip error subject to prediction and tracking limits.
+5. **Fit both maps jointly.** Optimize predictive preservation, recurrent
+   consistency, multi-prefix GHMM coordinate anchoring, and the root round trip.
+   Use the full teacher objective on every update and select by the full
+   validation objective.
+6. **Refine the encoder again.** Freeze the jointly fitted decoder, rebuild its
+   cached natural codes, and repeat constrained round-trip refinement.
+
+The teacher and GHMM coordinate system stay fixed throughout. All stages reuse
+the same teacher-sampled continuations, and only validation data select weights.
+The defaults are:
+
+| Stage | Updates | Learning rate | Selection |
+| --- | ---: | --- | --- |
+| Decoder regression | 40,000 | 0.001 → 0.00001 | Coordinate MSE |
+| Encoder fitting | 10,000 | 0.0003 → 0.00003 | Full objective |
+| Pre-joint encoder refinement | 2,000 | 0.0001 → 0.00001 | Constrained round-trip MSE |
+| Joint fitting | 1,000 | Decoder 0.0001 → 0.00001; encoder 0.0003 → 0.00003 | Full objective |
+| Final encoder refinement | 2,000 | 0.0001 → 0.00001 | Constrained round-trip MSE |
+
+Learning rates follow cosine schedules. The default decoder has eight learned
+queries per head and 128 tanh hidden units. Batches contain 64 rows, validation
+runs every 200 updates, and the default root length/horizon in the demo are
+16/16. Frozen-decoder stages use `teacher_every=20`: nineteen cheap updates,
+then one full update; their final update always uses the full objective.
+Refinement uses round-trip weight 0.3 and allows at most 5% degradation in each
+validation prediction/tracking metric relative to that refinement's starting
+checkpoint. Other auxiliary weights are 0.1.
+
+`FitConfig` exposes all these settings. Set `encoder_refine_steps=0` or
+`joint_refine_steps=0` to omit the corresponding refinement, and `teacher_every=1`
+to use full teacher updates throughout. `decoder_min_lr_fraction=1` disables
+decoder learning-rate decay. The trace labels the five optimization stages
+`decoder`, `encoder`, `encoder_refine`, `joint`, and `joint_refine`;
+`initialization.json` records selections, refinement constraints, and timings.
 
 Decoder pretraining samples prefixes from length 0 through root length plus
 `horizon` by default. Each training parent contributes one uniformly sampled
@@ -208,23 +261,6 @@ Trainable queries use random initialization and are optimized jointly with the
 readout across prefix lengths. Attention responses are recomputed as queries move.
 Validation trace entries include elapsed seconds from the start of fitting,
 including query initialization and cache preparation.
-
-1. **Fit a GHMM.** Query the teacher's joint probabilities of short futures.
-   Center their vectors, retain the leading singular directions, and fit one
-   observable operator per token by least squares on joint successor vectors.
-   An explicit constant coordinate enforces normalization. A four-dimensional
-   abstraction starts with a five-dimensional GHMM. Its initial state is
-   obtained from a separate empty-history query.
-2. **Fit the decoder.** Whiten GHMM coordinates using training roots and reuse
-   that transform at every prefix length. Regress these coordinates from
-   normalized attention responses and current-token coordinates. Queries can
-   be learned jointly with the readout, or sampled from the teacher and frozen.
-3. **Initialize and fit the encoder.** An affine map writes a representative
-   cache and relaxed token. Initialize it by least squares against natural
-   states, then fit with the decoder fixed.
-4. **Fit both maps jointly.** Optimize predictive preservation, recurrent
-   consistency, coordinate anchoring, and the root round trip. Select the
-   checkpoint with the smallest validation objective at each stage.
 
 There are two predictive losses. **Single insertion** writes the root once and
 lets the teacher's cache grow along a continuation. **Repeated compression**
@@ -258,9 +294,11 @@ Training and evaluation share the per-root rollout calculations; their mean
 versus summed KL conventions remain distinct.
 
 While the decoder is frozen, its natural root and successor codes are cached
-once. Refinement streams preparation in bounded batches and retains these
-compact targets instead of accumulating natural KV states across the dataset.
-Joint fitting recomputes targets as the decoder changes. Continuation sampling
+once and reused for initial encoder fitting and pre-joint refinement. Joint
+fitting recomputes targets as the decoder changes; final refinement rebuilds
+them from the selected joint checkpoint. Standalone refinement streams
+preparation in bounded batches and retains compact targets instead of
+accumulating natural KV states across the dataset. Continuation sampling
 in the belief-state adapter uses one teacher pass per observed token.
 
 Evaluation reports means and standard errors over root rows. `single_kl` and
@@ -268,9 +306,10 @@ Evaluation reports means and standard errors over root rows. `single_kl` and
 is the root error per coordinate; `tracking_mse` averages successor errors per
 coordinate and time step, excluding the root. Test data do not select weights.
 
-## Improve encoder round trips
+## Further encoder refinement
 
-Keep the teacher and decoder fixed and optimize the encoder further:
+The complete fit already includes constrained refinement before and after joint
+fitting. To extend it, keep the teacher and decoder fixed and run:
 
 ```python
 from gbs import RefineConfig, refine_encoder
@@ -293,14 +332,16 @@ absolute allowance of one machine epsilon per forecast token for summed KL,
 and one epsilon for tracking MSE. Raw measured KL values are retained, including
 tiny negative roundoff values. Limits and allowances are recorded in
 `initialization.json`; the starting encoder is always retained as a fallback.
-Refinement starts fresh Adam and new fixed continuation banks; it does not
-resume optimizer state. The demo's `--refine-steps` option runs this workflow.
+Every refinement starts fresh Adam. Standalone `refine_encoder` samples new
+fixed continuation banks; the integrated fitting stages reuse the fit's banks.
+The demo's `--refine-steps` option requests further refinement after the complete
+fit.
 
-To reduce teacher evaluations, set `teacher_every=20` in `RefineConfig` (or in
-the CLI's refinement JSON). Nineteen updates then optimize only the root round
+The default `teacher_every=20` in both `FitConfig` and `RefineConfig` reduces
+teacher evaluations. Nineteen updates optimize only the root round
 trip, followed by one update with the full teacher objective. The final update
-also uses the full objective. The default, `teacher_every=1`, uses it on every
-update. Cheap updates use the root coefficient from the full objective,
+also uses the full objective. Set `teacher_every=1` to use it on every update.
+Cheap updates use the root coefficient from the full objective,
 `roundtrip_weight + tracking_weight / (horizon + 1)`.
 
 All validation checks still use the full forecast horizon and all preservation
@@ -377,7 +418,8 @@ of an analytic three-symbol process. An end-to-end fit checks default GHMM
 initialization, split isolation, artifact reload, and frozen-decoder refinement.
 Additional tests check native pre-RoPE query capture, prefix-length coverage,
 frozen query banks across joint fitting and reload, and ridge regression with
-collinear features.
+collinear features. The complete staged fit checks continuation reuse, refreshed
+natural codes after joint fitting, and validation constraints in both refinements.
 Exact enumeration also checks the sequence-KL chain rule for repeated
 compression. CI runs the suite on Python 3.10 and 3.12.
 

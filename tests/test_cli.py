@@ -25,7 +25,8 @@ def inputs(request, tmp_path):
     torch.save(splits, histories)
     config = tmp_path/"fit.json"
     config.write_text(json.dumps(dict(dimension=1, queries_per_head=1, hidden=4, horizon=2,
-        future_length=1, spectral_samples=16, decoder_steps=2, encoder_steps=1, joint_steps=1,
+        future_length=1, spectral_samples=16, decoder_steps=2, encoder_steps=1,
+        encoder_refine_steps=1, joint_steps=1, joint_refine_steps=1,
         batch_size=2, validate_every=1, seed=10)))
     return checkpoint, histories, config
 
@@ -37,6 +38,9 @@ def test_shared_fit_refine_and_evaluate_commands(inputs, tmp_path):
     main(["fit", *common, "--output", str(fitted), "--config", str(config)])
     adapter = BeliefStateAdapter.from_checkpoint(checkpoint)
     model = GBSAbstraction.load(fitted/"abstraction.pt", adapter)
+    trace = json.loads((fitted/"trace.json").read_text())
+    assert {row["stage"] for row in trace} == {
+        "decoder", "encoder", "encoder_refine", "joint", "joint_refine"}
     assert bool(model.encoder.writable[:-1].all())
     assert not bool(model.encoder.writable[-1])
     before = {key: value.clone() for key, value in model.decoder.state_dict().items()}

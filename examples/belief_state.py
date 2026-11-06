@@ -106,7 +106,7 @@ def main():
     parser.add_argument("--threads", type=int, default=2)
     parser.add_argument("--quick", action="store_true", help="Small end-to-end smoke run, not a converged fit")
     parser.add_argument("--plot", action="store_true", help="Save decoded and round-trip coordinate projections")
-    parser.add_argument("--refine-steps", type=int, default=0, help="Optional frozen-decoder refinement after saving the initial fit")
+    parser.add_argument("--refine-steps", type=int, default=0, help="Further encoder refinement after saving the complete fit")
     args = parser.parse_args()
     if args.output.exists():
         parser.error("Output directory already exists; choose a new directory")
@@ -118,7 +118,8 @@ def main():
     config = FitConfig(seed=args.seed)
     if args.quick:
         config = FitConfig(seed=args.seed, spectral_samples=128, decoder_steps=200,
-            encoder_steps=100, joint_steps=200, batch_size=32, horizon=8, validate_every=100)
+            encoder_steps=100, encoder_refine_steps=20, joint_steps=200, joint_refine_steps=20,
+            batch_size=32, horizon=8, validate_every=100)
     histories = sample_histories(args.samples or (256 if args.quick else 4096), 16, args.epsilon, args.seed)
     splits = history_splits(dict(zip(["train", "validation", "test"], split_histories(histories, args.seed+1))), adapter, config.horizon)
     train, validation, test = (splits[name] for name in ["train", "validation", "test"])

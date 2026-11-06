@@ -24,15 +24,20 @@ class FitConfig(DecoderConfig):
     horizon: int = 16
     future_length: int = 4
     spectral_samples: int = 512
-    encoder_steps: int = 2000
-    joint_steps: int = 4000
+    encoder_steps: int = 10000
+    encoder_refine_steps: int = 2000
+    joint_steps: int = 1000
+    joint_refine_steps: int = 2000
     joint_decoder_lr: float = 1e-4
     encoder_lr: float = 3e-4
     tracking_weight: float = .1
     coordinate_weight: float = .1
     roundtrip_weight: float = .1
     max_outcomes: int = 65536
-    teacher_every: int = 1
+    teacher_every: int = 20
+    refine_lr: float = 1e-4
+    refine_roundtrip_weight: float = .3
+    preservation_slack: float = .05
 
 
 @dataclass
@@ -40,13 +45,13 @@ class RefineConfig:
     steps: int = 2000
     horizon: int = 16
     batch_size: int = 64
-    lr: float = 3e-4
+    lr: float = 1e-4
     tracking_weight: float = .1
-    roundtrip_weight: float = .1
+    roundtrip_weight: float = .3
     preservation_slack: float = .05
     validate_every: int = 200
     seed: int = 0
-    teacher_every: int = 1
+    teacher_every: int = 20
 
 
 @dataclass
@@ -71,6 +76,8 @@ def _validate_config(config):
         raise ValueError("teacher_every must be a positive integer")
     if config.teacher_every > 1 and config.roundtrip_weight + config.tracking_weight == 0:
         raise ValueError("Alternating updates require a positive round-trip or tracking weight")
+    if not np.isfinite(config.preservation_slack) or config.preservation_slack < 0:
+        raise ValueError("preservation_slack must be finite and nonnegative")
     if isinstance(config, FitConfig):
         validate_decoder_config(config)
     for key, value in asdict(config).items():
@@ -149,17 +156,23 @@ def _weighted_coordinate_transform(codes):
 def fit_abstraction(adapter: CacheModel, train_histories: Tensor, validation_histories: Tensor, *,
                     config: FitConfig | None = None, initializer: Callable[[Tensor], Tensor] | GHMM | None = None,
                     initialization_histories: list[Tensor] | None = None, progress=print) -> FitResult:
-    """Fit a fixed-length abstraction, selecting checkpoints on validation data only.
+    """Fit a decoder shared across positions, an affine encoder, and refine both.
 
     By default a GHMM supplies coordinates from the teacher's conditional futures.
     A supplied GHMM or callable can instead return initial coordinates. Callable
     outputs must have ``config.dimension`` columns; no HMM labels are required.
     Root rows determine the averaging distribution, e.g. process-sampled rows.
+    Frozen-decoder stages cache natural codes and alternate round-trip updates
+    with full teacher updates. Constrained encoder refinement runs before and
+    after joint fitting; set the corresponding refinement steps to zero to skip
+    either stage. All stages reuse the same teacher continuation banks. Cached
+    codes are rebuilt after joint fitting, when the decoder has changed.
     """
     config = config or FitConfig()
     _validate_config(config)
     train_histories = prepare_histories(train_histories, adapter.vocab_size)
-    validation_histories = prepare_histories(validation_histories, adapter.vocab_size)
+    validation_histories = prepare_histories(validation_histories, adapter.vocab_size,
+        min_rows=2 if config.encoder_refine_steps or config.joint_refine_steps else 1)
     check_history_pair(adapter, train_histories, validation_histories, config.horizon, config.allow_shared_histories)
     adapter.eval().requires_grad_(False)
     torch.manual_seed(config.seed)
@@ -212,13 +225,16 @@ def fit_abstraction(adapter: CacheModel, train_histories: Tensor, validation_his
     train_states = train.states
     encoder = AffineEncoder.initialize(adapter, train_states, train_target)
     model = GBSAbstraction(adapter, decoder, encoder, architecture)
-    for stage, steps in [("encoder", config.encoder_steps), ("joint", config.joint_steps)]:
+    for stage, steps, refine_steps in [("encoder", config.encoder_steps, config.encoder_refine_steps),
+                                     ("joint", config.joint_steps, config.joint_refine_steps)]:
+        started = time.perf_counter()
         decoder.requires_grad_(stage == "joint")
         stage_train = encode_bank(adapter, decoder, train) if stage == "encoder" else train
         stage_valid = encode_bank(adapter, decoder, valid) if stage == "encoder" else valid
         optimizer = torch.optim.Adam([dict(params=encoder.parameters(), lr=config.encoder_lr),
                                       dict(params=decoder.parameters(), lr=config.joint_decoder_lr)])
-        best, best_state = float("inf"), None
+        best, best_state, selected_step = float("inf"), None, 0
+        teacher_steps, roundtrip_steps = 0, 0
         for step in range(steps+1):
             if step % config.validate_every == 0 or step == steps:
                 with torch.no_grad():
@@ -230,8 +246,11 @@ def fit_abstraction(adapter: CacheModel, train_histories: Tensor, validation_his
                 score = sum(totals)/len(valid.states)+config.coordinate_weight*coordinate_score
                 trace.append(dict(stage=stage, step=step, validation_loss=score,
                                   validation_coordinate_mse=coordinate_score,
-                                  validation_coordinate_by_length=by_length))
-                if score < best: best, best_state = score, _interface_state(model)
+                                  validation_coordinate_by_length=by_length,
+                                  elapsed_seconds=time.perf_counter()-started,
+                                  teacher_steps=teacher_steps, roundtrip_steps=roundtrip_steps))
+                if score < best:
+                    best, best_state, selected_step = score, _interface_state(model), step
                 if progress: progress(f"{stage} {step}/{steps}: validation loss {score:.6g}")
             if step == steps: break
             fraction = .1+.45*(1+np.cos(np.pi*step/steps))
@@ -239,19 +258,41 @@ def fit_abstraction(adapter: CacheModel, train_histories: Tensor, validation_his
             optimizer.param_groups[1]["lr"] = config.joint_decoder_lr*fraction
             ids = torch.tensor(rng.integers(len(train.states), size=config.batch_size), device=adapter.device)
             if stage == "encoder":
-                loss, _ = _encoder_loss(model, stage_train.select(ids), config, step, steps)
+                loss, teacher_step = _encoder_loss(model, stage_train.select(ids), config, step, steps)
             else:
+                teacher_step = True
                 loss = abstraction_loss(model, stage_train.select(ids), tracking_weight=config.tracking_weight,
                     coordinate_weight=0, roundtrip_weight=config.roundtrip_weight)["total"]
                 if config.coordinate_weight:
                     x, y = decoder_result.training.sample(rng, config.batch_size)
                     predicted = decoder_result.training.prediction(decoder, adapter, x)
                     loss = loss+config.coordinate_weight*(predicted-y).square().mean()
+            teacher_steps += int(teacher_step)
+            roundtrip_steps += int(not teacher_step)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_([*encoder.parameters(), *decoder.parameters()], 1., error_if_nonfinite=True)
             optimizer.step()
         _restore(model, best_state)
+        diagnostics[stage] = dict(selected_step=selected_step, validation_loss=best,
+            teacher_steps=teacher_steps, roundtrip_steps=roundtrip_steps,
+            total_seconds=time.perf_counter()-started)
+        if refine_steps:
+            refinement_started = time.perf_counter()
+            decoder.requires_grad_(False)
+            if stage == "joint":
+                if progress: progress("Rebuilding cached natural codes after joint fitting")
+                stage_train, stage_valid = encode_bank(adapter, decoder, train), encode_bank(adapter, decoder, valid)
+            refine_config = RefineConfig(steps=refine_steps, horizon=config.horizon, batch_size=config.batch_size,
+                lr=config.refine_lr, tracking_weight=config.tracking_weight,
+                roundtrip_weight=config.refine_roundtrip_weight, preservation_slack=config.preservation_slack,
+                validate_every=config.validate_every, seed=config.seed, teacher_every=config.teacher_every)
+            label = f"{stage}_refine"
+            report = None if progress is None else lambda message: progress(f"{label}: {message}")
+            refined = _refine_encoder(model, stage_train, stage_valid, refine_config,
+                progress=report, started=refinement_started)
+            trace.extend(dict(row, stage=label) for row in refined.trace)
+            diagnostics[label] = dict(refined.initialization, config=refined.config)
     diagnostics.update(center=center.cpu().tolist(), whitener=whitener.cpu().tolist())
     return FitResult(model.eval(), asdict(config), trace, diagnostics)
 
@@ -303,15 +344,22 @@ def refine_encoder(model, train_histories, validation_histories, *, config=None,
     config = config or RefineConfig()
     started = time.perf_counter()
     _validate_config(config)
-    if config.preservation_slack < 0: raise ValueError("preservation_slack cannot be negative")
     train_histories = prepare_histories(train_histories, model.adapter.vocab_size)
     validation_histories = prepare_histories(validation_histories, model.adapter.vocab_size, min_rows=2)
     check_history_pair(model.adapter, train_histories, validation_histories, config.horizon)
     model.adapter.eval().requires_grad_(False)
     model.decoder.requires_grad_(False)
-    initial_decoder = copy.deepcopy(model.decoder.state_dict())
     train = make_bank(model.adapter, train_histories, config.horizon, seed=config.seed+10, decoder=model.decoder)
     valid = make_bank(model.adapter, validation_histories, config.horizon, seed=config.seed+11, decoder=model.decoder)
+    return _refine_encoder(model, train, valid, config, progress=progress,
+        started=started, checkpoint_directory=checkpoint_directory)
+
+
+def _refine_encoder(model, train: EncodedBank, valid: EncodedBank, config, *, progress, started,
+                    checkpoint_directory=None):
+    """Refine against fixed continuations and codes from the current frozen decoder."""
+    _validate_config(config)
+    initial_decoder = copy.deepcopy(model.decoder.state_dict())
     prepared = time.perf_counter()
     starting = _evaluate_bank(model, valid)
     validation_seconds = time.perf_counter()-prepared

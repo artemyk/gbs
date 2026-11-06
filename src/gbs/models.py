@@ -13,8 +13,8 @@ from .adapters import CacheModel
 @dataclass
 class Architecture:
     dimension: int = 4
-    queries_per_head: int = 4
-    hidden: int | None = 64
+    queries_per_head: int = 8
+    hidden: int | None = 128
     learn_queries: bool = True
 
 

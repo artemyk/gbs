@@ -15,12 +15,12 @@ from .models import Architecture, AttentionDecoder
 @dataclass
 class DecoderConfig:
     dimension: int = 4
-    queries_per_head: int = 4
-    hidden: int | None = 64
-    decoder_steps: int = 5000
+    queries_per_head: int = 8
+    hidden: int | None = 128
+    decoder_steps: int = 40000
     batch_size: int = 64
     decoder_lr: float = 1e-3
-    decoder_min_lr_fraction: float = 1.0
+    decoder_min_lr_fraction: float = .01
     validate_every: int = 200
     seed: int = 0
     allow_shared_histories: bool = False
