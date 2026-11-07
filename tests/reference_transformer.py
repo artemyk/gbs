@@ -1,5 +1,5 @@
 """Small independent native forward pass used to validate the adapter."""
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 import torch
 from torch import nn
@@ -64,3 +64,13 @@ class Transformer(nn.Module):
             x = x+block.out(result.transpose(1, 2).reshape(len(x), n, -1))
             x = x+block.mlp(block.ln2(x))
         return self.unembed(self.ln_final(x))
+
+
+def make_model(cfg):
+    """Production blocks initialized with the independent reference's weights."""
+    from gbs.adapters._belief_state_model import Config as ModelConfig, Transformer as Model
+    reference = Transformer(cfg)
+    with torch.random.fork_rng(devices=[]):
+        model = Model(ModelConfig(**asdict(cfg)))
+    model.load_state_dict(reference.state_dict())
+    return model

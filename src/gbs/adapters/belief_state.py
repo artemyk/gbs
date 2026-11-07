@@ -7,8 +7,8 @@ import torch
 import torch.nn.functional as F
 
 from .base import CacheModel
-from ._belief_state_model import Config, Transformer, attention_projection, rotate
-from ..data import prepare_histories
+from ._belief_state_model import Config, Transformer, rotate
+from ..data import prepare_histories, token_ids
 
 
 class BeliefStateAdapter(CacheModel):
@@ -29,19 +29,22 @@ class BeliefStateAdapter(CacheModel):
         self.n_heads, self.head_dim = cfg.n_heads, cfg.d_head
         self.token_features = cfg.vocab + 1
         self.max_history = cfg.context
-        self.bos_visible = getattr(cfg, "bos_visible", False)
+        self.bos_visible = getattr(cfg, "bos_visible", True)
         self.rope = cfg.rope
         self.entry_width = self.n_layers*self.n_heads*2*self.head_dim
         if self.dtype not in [torch.float32, torch.float64]:
             raise ValueError("This adapter currently supports float32 and float64 teachers")
 
     @classmethod
-    def from_checkpoint(cls, checkpoint, *, device="cpu"):
+    def from_checkpoint(cls, checkpoint, *, device="cpu", bos_visible=None):
         """Load upstream's config + model state dictionary; no source checkout needed.
 
         The checkpoint contains tensors and ordinary Python data and is loaded
         with weights_only=True. Unknown model fields or mismatched parameter
         names/shapes raise errors rather than silently changing the architecture.
+        BOS is visible by default. For historical masked-BOS checkpoints missing
+        that setting, pass bos_visible=False. An explicit checkpoint setting
+        cannot be overridden with a conflicting value.
         """
         saved = torch.load(checkpoint, map_location="cpu", weights_only=True)
         if not isinstance(saved, dict) or not {"config", "model"} <= saved.keys():
@@ -51,6 +54,10 @@ class BeliefStateAdapter(CacheModel):
         for name in ("attention_mass", "attention_sums"):
             if config.pop(name, False):
                 raise ValueError("Only standard softmax attention is supported")
+        if bos_visible is not None:
+            if "bos_visible" in config and config["bos_visible"] != bos_visible:
+                raise ValueError("bos_visible conflicts with the checkpoint configuration")
+            config["bos_visible"] = bos_visible
         model = Transformer(Config(**config))
         model.to(dtype=saved["model"]["embed.weight"].dtype)
         model.load_state_dict(saved["model"])
@@ -63,7 +70,7 @@ class BeliefStateAdapter(CacheModel):
 
     def spec(self):
         # Keep standard-teacher identity stable for saved abstraction checkpoints.
-        config = dict(attention_mass=False, attention_sums=False, bos_visible=False)
+        config = dict(attention_mass=False, attention_sums=False, bos_visible=self.bos_visible)
         config.update(asdict(self.model.cfg))
         return dict(**super().spec(), layout="kv-token-length-v1", config=config)
 
@@ -89,11 +96,6 @@ class BeliefStateAdapter(CacheModel):
         mask = super().encoder_mask(state)
         mask[-1] = False
         return mask
-
-    def _qkv(self, block, x):
-        batch, length, _ = x.shape
-        q, k, v = block.qkv(block.ln1(x)).reshape(batch, length, 3, self.n_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        return q, k, v
 
     @torch.no_grad()
     def history_state(self, histories):
@@ -126,13 +128,8 @@ class BeliefStateAdapter(CacheModel):
             mask[1:, 0] = False
         all_k, all_v = [], []
         for layer, block in enumerate(self.model.blocks):
-            q, k, v = self._qkv(block, x)
-            if self.rope:
-                q, k = rotate(q, positions), rotate(k, positions)
-            k = torch.cat([keys[:, :, layer].transpose(1, 2), k], 2)
-            v = torch.cat([values[:, :, layer].transpose(1, 2), v], 2)
-            x = x + attention_projection(block, q, k, v, mask)
-            x = x + block.mlp(block.ln2(x))
+            cache = (keys[:, :, layer].transpose(1, 2), values[:, :, layer].transpose(1, 2))
+            x, _, (k, v) = block(x, mask, positions=positions, cache=cache)
             all_k.append(k.transpose(1, 2))
             all_v.append(v.transpose(1, 2))
         return self.model.unembed(self.model.ln_final(x)).log_softmax(-1), torch.stack(all_k, 2), torch.stack(all_v, 2), n
@@ -142,6 +139,9 @@ class BeliefStateAdapter(CacheModel):
         return self._pass(states, tokens)[0][:, 0]
 
     def advance(self, states, tokens):
+        tokens = token_ids(tokens, self.vocab_size, device=states.device)
+        if tokens.shape != (len(states),):
+            raise ValueError("Provide one token per state")
         lp, keys, values, n = self._pass(states, tokens[:, None])
         if n == 0 and not self.bos_visible:
             keys, values = keys[:, 1:], values[:, 1:]
@@ -164,6 +164,9 @@ class BeliefStateAdapter(CacheModel):
         return torch.stack(tokens, 1), torch.stack(probabilities, 1)
 
     def trajectory(self, states, tokens):
+        tokens = prepare_histories(tokens, self.vocab_size, device=states.device)
+        if len(tokens) != len(states):
+            raise ValueError("Provide one continuation per state")
         lp, keys, values, n = self._pass(states, tokens)
         past = (states.shape[1]-self.token_features-1)//self.entry_width
         successors = []

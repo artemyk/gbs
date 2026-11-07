@@ -156,9 +156,9 @@ def test_invalid_teacher_update_intervals_are_rejected(interval):
 def test_cheap_joint_update_uses_current_codes_and_trains_both_maps_without_rollouts(monkeypatch):
     from gbs import Architecture, AttentionDecoder, AffineEncoder, BeliefStateAdapter
     from gbs.fit import _joint_loss
-    from reference_transformer import Config, Transformer
+    from reference_transformer import Config, make_model
     torch.manual_seed(17)
-    adapter = BeliefStateAdapter(Transformer(Config(vocab=2, bos_visible=True)).double())
+    adapter = BeliefStateAdapter(make_model(Config(vocab=2, bos_visible=True)).double())
     bank = make_bank(adapter, words(2, 3), 2, seed=17)
     architecture = Architecture(2, 1, 4)
     decoder = AttentionDecoder(adapter, architecture)

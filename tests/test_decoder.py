@@ -5,12 +5,12 @@ import torch
 
 from gbs import AffineEncoder, BeliefStateAdapter, DecoderConfig, GBSAbstraction, fit_decoder
 from gbs.adapters import words
-from reference_transformer import Config, Transformer
+from reference_transformer import Config, make_model
 
 
 @pytest.mark.parametrize('rope', [False, True])
 def test_learned_prefix_queries_update_and_saved_abstraction_preserves_predictions(rope, tmp_path):
-    adapter = BeliefStateAdapter(Transformer(Config(rope=rope, bos_visible=True)).double())
+    adapter = BeliefStateAdapter(make_model(Config(rope=rope, bos_visible=True)).double())
     parents = words(3, 5)
     train, valid = parents[:100], parents[100:120]
     config = DecoderConfig(dimension=2, queries_per_head=3, hidden=8, decoder_steps=20,
@@ -47,7 +47,7 @@ def test_learned_prefix_preparation_uses_bounded_batches():
         def history_state(self, histories):
             self.batches.append(len(histories))
             return super().history_state(histories)
-    adapter = CountingAdapter(Transformer(Config(vocab=2)))
+    adapter = CountingAdapter(make_model(Config(vocab=2)))
     parents = words(2, 4)
     result = fit_decoder(adapter, parents[:8], parents[8:], lambda h: h.float().sum(1, keepdim=True),
         config=DecoderConfig(dimension=1, queries_per_head=2, hidden=4, decoder_steps=0,
@@ -58,7 +58,7 @@ def test_learned_prefix_preparation_uses_bounded_batches():
 
 
 def test_prefix_domain_and_parent_split_validation():
-    adapter = BeliefStateAdapter(Transformer(Config()))
+    adapter = BeliefStateAdapter(make_model(Config()))
     parents = words(3, 3)
     target = lambda h: h.float().sum(1, keepdim=True)
     with pytest.raises(ValueError, match='overlap'):
@@ -76,7 +76,7 @@ def test_prefix_domain_and_parent_split_validation():
 def test_full_fit_anchors_prefixes_with_learned_queries():
     from gbs import FitConfig, fit_abstraction
     torch.manual_seed(5)
-    adapter = BeliefStateAdapter(Transformer(Config(bos_visible=True)).double())
+    adapter = BeliefStateAdapter(make_model(Config(bos_visible=True)).double())
     roots = words(3, 3)
     result = fit_abstraction(adapter, roots[:15], roots[15:],
         initializer=lambda h: h.double().sum(1, keepdim=True), config=FitConfig(

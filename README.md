@@ -5,7 +5,7 @@ Method and experiments: [Generalized belief states in transformers](https://www.
 Fit a low-dimensional predictive state to a trained, frozen transformer. A
 **decoder** reads the transformer's KV cache and current token into coordinates
 `z`. An **encoder** writes those coordinates into a representative KV cache and
-a continuous current-token embedding. Running the original transformer on a
+continuous current-token coordinates. Running the original transformer on a
 written state supplies the prediction and update maps of a recurrent model.
 
 The default initialization is a generalized hidden Markov model (GHMM) fitted
@@ -30,7 +30,8 @@ does not include pretrained transformer weights or publish a PyPI release.
 
 The supplied adapter supports the transformers in
 [artemyk/belief-state](https://github.com/artemyk/belief-state). Start with its
-four-layer, width-64 RoPE model, trained on MRRXOR with mixing probability 0.05:
+four-layer, width-64 RoPE model with visible BOS, trained on MRRXOR with mixing
+probability 0.05:
 
 ```sh
 python examples/belief_state.py --quick --plot
@@ -44,10 +45,10 @@ python examples/belief_state.py --output outputs/rope-full --plot
 ```
 
 The demo downloads only the roughly 0.6 MB
-[checkpoint](https://github.com/artemyk/belief-state/blob/61c2a5570ce7df8ca5a739b2ecc0a27716cea5c4/runs/L4_d64_rope/eps0.05/s0.pt),
-pinned to upstream commit `61c2a5570ce7df8ca5a739b2ecc0a27716cea5c4`, and verifies
+[checkpoint](https://github.com/artemyk/belief-state/blob/301c2508a9994528b70dff07ac8017edd4c25d6f/runs/L4_d64_rope/eps0.05/s0.pt),
+pinned to upstream commit `301c2508a9994528b70dff07ac8017edd4c25d6f`, and verifies
 its SHA-256 checksum. It caches the file at
-`checkpoints/L4_d64_rope_eps0.05_s0.pt`; subsequent runs reuse the verified file.
+`checkpoints/L4_d64_rope_bos_eps0.05_s0.pt`; subsequent runs reuse the verified file.
 No source checkout is needed. Use `--checkpoint path/to/model.pt` for a local
 checkpoint, including a visible-BOS RoPE model. The adapter supports standard
 softmax attention with RoPE or learned positions, optional visible BOS, and
@@ -72,6 +73,19 @@ source execution. Configurations must specify all trained attention and
 position options; unknown fields and mismatched weights raise errors. This
 loader is specific to the belief-state architecture; other model families use
 their own `CacheModel` adapter. The encoder and fitting code are shared.
+
+BOS is visible by default, including when older standard-BOS checkpoints omit
+`bos_visible`. New belief-state checkpoints record this setting in `config`.
+An explicit `bos_visible=False` preserves a masked-BOS model. For historical
+masked-BOS files that omit the setting, load them with
+`BeliefStateAdapter.from_checkpoint(path, bos_visible=False)`. Conflicting
+explicit settings are rejected. The demo's visible-BOS cache filename is
+distinct from the historical masked-BOS download.
+
+Ordinary sequences and cached continuations use the same `Block.forward`
+computation. The adapter handles flat-state packing, token coordinates, and
+history length; each block handles normalization, projections, RoPE, attention,
+and the MLP. Parameter names and the PyTorch checkpoint format are unchanged.
 
 The demo samples length-16 MRRXOR histories. Distinct histories are assigned to
 disjoint training, validation, and test sets, retaining each history's sampling
@@ -130,7 +144,8 @@ configuration, and validation trace. The same default evaluation seed is used
 across commands; set `--evaluation-seed` to change it. `--device` and `--threads`
 control execution. The commands call the shared Python fitting API below;
 there are no separate encoder or fitting branches for BOS and attention variants.
-Integer histories are validated and converted to `torch.long` before indexing;
+Integer histories and tokens passed to `advance` or `trajectory` are validated
+and converted to `torch.long` before indexing;
 floating-point histories are rejected. The history hash in `run.json` identifies
 the saved normalized splits; the CLI also records the original input-file hash.
 
@@ -141,7 +156,7 @@ import torch
 from gbs import BeliefStateAdapter, FitConfig, fit_abstraction, evaluate
 
 teacher = BeliefStateAdapter.from_checkpoint(
-    "checkpoints/L4_d64_rope_eps0.05_s0.pt",
+    "checkpoints/L4_d64_rope_bos_eps0.05_s0.pt",
     device="cpu",
 )
 # Supply disjoint integer tensors (number_of_histories, history_length).

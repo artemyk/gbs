@@ -19,15 +19,15 @@ from gbs.data import DEFAULT_EVALUATION_SEED, history_splits
 from gbs.runs import save_run
 
 
-DEMO_COMMIT = "61c2a5570ce7df8ca5a739b2ecc0a27716cea5c4"
+DEMO_COMMIT = "301c2508a9994528b70dff07ac8017edd4c25d6f"
 DEMO_URL = f"https://raw.githubusercontent.com/artemyk/belief-state/{DEMO_COMMIT}/runs/L4_d64_rope/eps0.05/s0.pt"
-DEMO_SHA256 = "ed2dd66a861de49e7268d4521c8a3e36923b1cd6c215b96f31b99d75515a1ff6"
+DEMO_SHA256 = "b390e7ae52f318ab3f68793b9ac4b7dcfe5ae6cfbddb4654a8cbfa1c362e9400"
 
 
 def demo_checkpoint(directory):
     """Download one pinned checkpoint, validating new and cached files by SHA-256."""
     directory.mkdir(parents=True, exist_ok=True)
-    path = directory/"L4_d64_rope_eps0.05_s0.pt"
+    path = directory/"L4_d64_rope_bos_eps0.05_s0.pt"
     if not path.exists():
         torch.hub.download_url_to_file(DEMO_URL, str(path), hash_prefix=DEMO_SHA256, progress=True)
     if hashlib.sha256(path.read_bytes()).hexdigest() != DEMO_SHA256:

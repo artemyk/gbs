@@ -20,7 +20,7 @@ class Config:
     d_head: int = 8
     d_mlp: int = 256
     rope: bool = False
-    bos_visible: bool = False
+    bos_visible: bool = True
 
     def __post_init__(self):
         dimensions = [self.vocab, self.context, self.d_model, self.n_layers, self.n_heads, self.d_head, self.d_mlp]
@@ -39,12 +39,6 @@ def rotate(x, positions):
     return torch.cat([a*cos-b*sin, a*sin+b*cos], -1)
 
 
-def attention_projection(block, q, k, v, mask):
-    """The teacher's attention projection, shared by native and cached execution."""
-    response = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
-    return block.out(response.transpose(1, 2).flatten(2))
-
-
 class Block(nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -55,15 +49,29 @@ class Block(nn.Module):
         self.ln2 = nn.LayerNorm(cfg.d_model)
         self.mlp = nn.Sequential(nn.Linear(cfg.d_model, cfg.d_mlp), nn.ReLU(), nn.Linear(cfg.d_mlp, cfg.d_model))
 
-    def forward(self, x, mask):
+    def forward(self, x, mask=None, *, positions=None, cache=None):
+        """Run a full sequence or continue a cache through the same block math.
+
+        Keys and values have shape (batch, heads, positions, head_dim); cached
+        keys already include RoPE. Return residuals, normalized inputs, and the
+        extended (keys, values), preserving gradients through the supplied cache.
+        Explicit positions support historical caches whose BOS was omitted.
+        """
         normalized = self.ln1(x)
         batch, length, _ = x.shape
+        past = 0 if cache is None else cache[0].shape[-2]
+        if positions is None:
+            positions = torch.arange(past, past+length, device=x.device)
         q, k, v = self.qkv(normalized).reshape(batch, length, 3, self.n_heads, self.d_head).permute(2, 0, 3, 1, 4)
         if self.rope:
-            positions = torch.arange(length, device=x.device)
             q, k = rotate(q, positions), rotate(k, positions)
-        x = x+attention_projection(self, q, k, v, mask)
-        return x+self.mlp(self.ln2(x)), normalized
+        if cache is not None:
+            k, v = torch.cat([cache[0], k], 2), torch.cat([cache[1], v], 2)
+        if mask is None and past:
+            mask = torch.arange(past+length, device=x.device)[None] <= past+torch.arange(length, device=x.device)[:, None]
+        attention = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=mask is None)
+        x = x+self.out(attention.transpose(1, 2).flatten(2))
+        return x+self.mlp(self.ln2(x)), normalized, (k, v)
 
 
 class Transformer(nn.Module):
@@ -88,7 +96,7 @@ class Transformer(nn.Module):
             mask[1:, 0] = False
         normalized = []
         for block in self.blocks:
-            x, block_input = block(x, mask)
+            x, block_input, _ = block(x, mask)
             normalized.append(block_input)
         final = self.ln_final(x)
         logits = self.unembed(final)

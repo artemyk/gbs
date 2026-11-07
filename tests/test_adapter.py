@@ -6,20 +6,22 @@ import torch
 
 from gbs import BeliefStateAdapter, Architecture, AttentionDecoder, AffineEncoder, GBSAbstraction
 from gbs.adapters import CacheModel
-from reference_transformer import Config, Transformer, rotary
+from reference_transformer import Config, Transformer as ReferenceTransformer, make_model, rotary
 
 
 @pytest.fixture(params=list(itertools.product([False, True], [False, True])))
 def adapter(request):
     rope, bos = request.param
     torch.manual_seed(42)
-    return BeliefStateAdapter(Transformer(Config(rope=rope, bos_visible=bos)).double())
+    return BeliefStateAdapter(make_model(Config(rope=rope, bos_visible=bos)).double())
 
 
 def test_native_predictions_cache_states_and_context_bounds(adapter):
     torch.manual_seed(1)
     tokens = torch.randint(adapter.vocab_size, (2, 12))
-    native = adapter.model(tokens).log_softmax(-1)
+    reference = ReferenceTransformer(Config(**asdict(adapter.model.cfg))).to(adapter.dtype)
+    reference.load_state_dict(adapter.model.state_dict())
+    native = reference(tokens).log_softmax(-1)
     for n in [0, 1, 4, 11]:
         state = adapter.history_state(tokens[:, :n])
         torch.testing.assert_close(adapter.predict(state), native[:, n], atol=1e-10, rtol=1e-10)
@@ -119,7 +121,7 @@ def test_checkpoint_rejects_missing_or_mismatched_architecture(tmp_path):
     torch.save(dict(weights={}), path)
     with pytest.raises(ValueError, match="config and model"):
         BeliefStateAdapter.from_checkpoint(path)
-    model = Transformer(Config())
+    model = make_model(Config())
     config = asdict(model.cfg)
     torch.save(dict(config=dict(config, unknown_architecture=True), model=model.state_dict()), path)
     with pytest.raises(TypeError, match="unknown_architecture"):
@@ -157,3 +159,43 @@ def test_single_pass_sampling_matches_generic_sampling(adapter, monkeypatch):
         assert len(calls) == 3
         torch.testing.assert_close(tokens, expected_tokens)
         torch.testing.assert_close(probabilities, expected_probabilities, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8])
+def test_cached_updates_normalize_integer_tokens(adapter, dtype):
+    state = adapter.history_state(torch.tensor([[0, 1], [2, 0]]))
+    tokens = torch.tensor([[1, 2], [0, 1]])
+    expected, states = adapter.trajectory(state, tokens)
+    actual, successors = adapter.trajectory(state, tokens.to(dtype))
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    for first, second in zip(states, successors):
+        torch.testing.assert_close(first, second, atol=0, rtol=0)
+    a, b = adapter.advance(state, tokens[:, 0].to(dtype))
+    torch.testing.assert_close(a, expected[:, 0], atol=1e-10, rtol=1e-10)
+    torch.testing.assert_close(b, states[0], atol=1e-10, rtol=1e-10)
+    with pytest.raises(ValueError, match="integer"):
+        adapter.advance(state, tokens[:, 0].float())
+    with pytest.raises(ValueError, match="vocabulary"):
+        adapter.trajectory(state, tokens+adapter.vocab_size)
+
+
+def test_checkpoint_without_bos_metadata_defaults_to_visible(tmp_path):
+    torch.manual_seed(13)
+    source = ReferenceTransformer(Config(bos_visible=True)).double()
+    config = asdict(source.cfg)
+    config.pop("bos_visible")
+    checkpoint = tmp_path/"standard-bos.pt"
+    torch.save(dict(config=config, model=source.state_dict()), checkpoint)
+    teacher = BeliefStateAdapter.from_checkpoint(checkpoint)
+    assert teacher.bos_visible
+    histories = torch.randint(source.cfg.vocab, (3, 5))
+    expected = source(torch.cat([histories, torch.zeros(3, 1, dtype=torch.long)], 1))[:, -1].log_softmax(-1)
+    torch.testing.assert_close(teacher.predict(teacher.history_state(histories)), expected, atol=1e-10, rtol=1e-10)
+    historical = BeliefStateAdapter.from_checkpoint(checkpoint, bos_visible=False)
+    source.cfg.bos_visible = False
+    expected = source(torch.cat([histories, torch.zeros(3, 1, dtype=torch.long)], 1))[:, -1].log_softmax(-1)
+    torch.testing.assert_close(historical.predict(historical.history_state(histories)), expected, atol=1e-10, rtol=1e-10)
+    config["bos_visible"] = True
+    torch.save(dict(config=config, model=source.state_dict()), checkpoint)
+    with pytest.raises(ValueError, match="conflicts"):
+        BeliefStateAdapter.from_checkpoint(checkpoint, bos_visible=False)
