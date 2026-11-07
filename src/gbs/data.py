@@ -54,67 +54,26 @@ class DataBank:
     states: Tensor
     tokens: Tensor
     reference: Tensor
-    anchors: Tensor | None = None
 
     def select(self, ids):
-        return DataBank(self.states[ids], self.tokens[ids], self.reference[ids],
-                        None if self.anchors is None else self.anchors[ids])
-
-
-@dataclass
-class EncodedBank:
-    """Compact natural targets, valid only while the decoder stays frozen."""
-    codes: Tensor
-    targets: Tensor
-    tokens: Tensor
-    reference: Tensor
-    anchors: Tensor | None = None
-
-    def select(self, ids):
-        return EncodedBank(self.codes[ids], self.targets[ids], self.tokens[ids], self.reference[ids],
-                           None if self.anchors is None else self.anchors[ids])
+        return DataBank(self.states[ids], self.tokens[ids], self.reference[ids])
 
 
 @torch.no_grad()
-def encode_bank(adapter, decoder, bank: DataBank):
-    """Cache detached natural targets; the decoder must remain frozen afterward."""
-    if any(parameter.requires_grad for parameter in decoder.parameters()):
-        raise ValueError("Caching natural targets requires a frozen decoder")
-    codes, targets = [], []
-    for left in range(0, len(bank.tokens), 256):
-        data = bank.select(slice(left, left+256))
-        codes.append(decoder(adapter, data.states))
-        _, successors = adapter.trajectory(data.states, data.tokens)
-        targets.append(torch.stack([decoder(adapter, state) for state in successors], 1))
-    return EncodedBank(torch.cat(codes), torch.cat(targets), bank.tokens, bank.reference, bank.anchors)
-
-
-@torch.no_grad()
-def make_bank(adapter, histories, horizon, *, seed, anchors=None, batch_size=256, decoder=None):
-    """Sample fixed futures in bounded batches; optionally retain only encoded targets.
-
-    Supplying a frozen decoder streams natural KV states through it and discards
-    each raw batch. The returned EncodedBank never retains the full natural cache.
-    """
+def make_bank(adapter, histories, horizon, *, seed, batch_size=256):
+    """Sample fixed teacher futures and retain natural root states in bounded batches."""
     histories = prepare_histories(histories, adapter.vocab_size)
     if horizon < 1 or batch_size < 1:
         raise ValueError("Forecast horizon and preparation batch size must be positive")
     if adapter.max_history is not None and histories.shape[1]+horizon > adapter.max_history:
         raise ValueError("Root length plus forecast horizon exceeds the teacher context")
     rng = np.random.default_rng(seed)
-    states, codes, targets, tokens, reference = [], [], [], [], []
+    states, tokens, reference = [], [], []
     for left in range(0, len(histories), batch_size):
         raw = adapter.history_state(histories[left:left+batch_size].to(adapter.device))
         uniforms = torch.tensor(rng.random((len(raw), horizon)), device=adapter.device, dtype=adapter.dtype)
         token, q = adapter.sample(raw, uniforms)
-        if decoder is None:
-            states.append(raw)
-        else:
-            encoded = encode_bank(adapter, decoder, DataBank(raw, token, q))
-            codes.append(encoded.codes)
-            targets.append(encoded.targets)
+        states.append(raw)
         tokens.append(token)
         reference.append(q)
-    if decoder is not None:
-        return EncodedBank(torch.cat(codes), torch.cat(targets), torch.cat(tokens), torch.cat(reference), anchors)
-    return DataBank(torch.cat(states), torch.cat(tokens), torch.cat(reference), anchors)
+    return DataBank(torch.cat(states), torch.cat(tokens), torch.cat(reference))

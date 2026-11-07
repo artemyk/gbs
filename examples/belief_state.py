@@ -14,7 +14,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from gbs import BeliefStateAdapter, FitConfig, RefineConfig, fit_abstraction, refine_encoder
+from gbs import BeliefStateAdapter, FitConfig, fit_abstraction
 from gbs.data import DEFAULT_EVALUATION_SEED, history_splits
 from gbs.runs import save_run
 
@@ -106,19 +106,16 @@ def main():
     parser.add_argument("--threads", type=int, default=2)
     parser.add_argument("--quick", action="store_true", help="Small end-to-end smoke run, not a converged fit")
     parser.add_argument("--plot", action="store_true", help="Save decoded and round-trip coordinate projections")
-    parser.add_argument("--refine-steps", type=int, default=0, help="Further encoder refinement after saving the complete fit")
     args = parser.parse_args()
     if args.output.exists():
         parser.error("Output directory already exists; choose a new directory")
-    if args.refine_steps < 0:
-        parser.error("refine-steps cannot be negative")
     torch.set_num_threads(args.threads)
     checkpoint = args.checkpoint or demo_checkpoint(args.checkpoint_dir)
     adapter = BeliefStateAdapter.from_checkpoint(checkpoint, device=args.device)
     config = FitConfig(seed=args.seed)
     if args.quick:
         config = FitConfig(seed=args.seed, spectral_samples=128, decoder_steps=200,
-            encoder_steps=100, encoder_refine_steps=20, joint_steps=200, joint_refine_steps=20,
+            joint_steps=200,
             batch_size=32, horizon=8, validate_every=100)
     histories = sample_histories(args.samples or (256 if args.quick else 4096), 16, args.epsilon, args.seed)
     splits = history_splits(dict(zip(["train", "validation", "test"], split_histories(histories, args.seed+1))), adapter, config.horizon)
@@ -134,13 +131,6 @@ def main():
     print(json.dumps(metrics, indent=2), flush=True)
     if args.plot:
         geometry(result.abstraction, test, args.output/"geometry.png")
-    if args.refine_steps:
-        refined = refine_encoder(result.abstraction, train, validation, config=RefineConfig(
-            steps=args.refine_steps, horizon=config.horizon, batch_size=config.batch_size,
-            validate_every=config.validate_every, roundtrip_weight=.3, seed=args.seed+2000), progress=progress)
-        save_run(args.output/"refined", refined.abstraction, splits, teacher_checkpoint=checkpoint,
-            horizon=config.horizon, evaluation_seed=args.evaluation_seed, result=refined,
-            metadata=dict(metadata, command="refine"), initial_abstraction=args.output/"abstraction.pt")
     print(f"Saved fit to {args.output}", flush=True)
 
 

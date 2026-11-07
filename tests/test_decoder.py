@@ -79,9 +79,9 @@ def test_full_fit_anchors_prefixes_with_learned_queries():
     adapter = BeliefStateAdapter(Transformer(Config(bos_visible=True)).double())
     roots = words(3, 3)
     result = fit_abstraction(adapter, roots[:15], roots[15:],
-        initializer=lambda h: h.double().sum(1, keepdim=True), config=FitConfig(encoder_refine_steps=0, joint_refine_steps=0,
+        initializer=lambda h: h.double().sum(1, keepdim=True), config=FitConfig(
             dimension=1, queries_per_head=2, hidden=8,
-            horizon=2, decoder_steps=0, encoder_steps=2, joint_steps=2,
+            horizon=2, decoder_steps=0, joint_steps=2,
             validate_every=2), progress=None)
     joint = [r for r in result.trace if r['stage'] == 'joint']
     assert len(joint) == 2

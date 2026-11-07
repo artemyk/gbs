@@ -1,4 +1,4 @@
-"""Shared fit, refinement, and evaluation commands for belief-state checkpoints."""
+"""Shared fit and evaluation commands for belief-state checkpoints."""
 from __future__ import annotations
 
 import argparse
@@ -9,7 +9,7 @@ import torch
 
 from .adapters import BeliefStateAdapter
 from .data import DEFAULT_EVALUATION_SEED, history_splits
-from .fit import FitConfig, RefineConfig, fit_abstraction, refine_encoder
+from .fit import FitConfig, fit_abstraction
 from .models import GBSAbstraction
 from .runs import save_run
 
@@ -17,7 +17,7 @@ from .runs import save_run
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="gbs", description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ["fit", "refine", "evaluate"]:
+    for name in ["fit", "evaluate"]:
         command = commands.add_parser(name)
         command.add_argument("--teacher", type=Path, required=True, help="Transformer config + state-dictionary checkpoint")
         command.add_argument("--histories", type=Path, required=True, help="Tensor dictionary containing train/validation/test histories")
@@ -30,7 +30,7 @@ def main(argv=None):
         if name == "evaluate":
             command.add_argument("--horizon", type=int, default=16)
         else:
-            command.add_argument("--config", type=Path, help=f"JSON fields for {'FitConfig' if name == 'fit' else 'RefineConfig'}")
+            command.add_argument("--config", type=Path, help="JSON fields for FitConfig")
     args = parser.parse_args(argv)
     try:
         if args.output.exists():
@@ -43,7 +43,7 @@ def main(argv=None):
             config, horizon = None, args.horizon
         else:
             fields = json.loads(args.config.read_text()) if args.config else {}
-            config = (FitConfig if args.command == "fit" else RefineConfig)(**fields)
+            config = FitConfig(**fields)
             horizon = config.horizon
         splits = history_splits(torch.load(args.histories, map_location="cpu", weights_only=True), adapter, horizon)
         result = None
@@ -52,8 +52,6 @@ def main(argv=None):
             model = result.abstraction
         else:
             model = GBSAbstraction.load(args.abstraction, adapter)
-            if args.command == "refine":
-                result = refine_encoder(model, splits["train"], splits["validation"], config=config)
         metrics = save_run(args.output, model, splits, teacher_checkpoint=args.teacher, horizon=horizon,
             evaluation_seed=args.evaluation_seed, result=result,
             metadata=dict(command=args.command, input_histories_sha256=hashlib.sha256(args.histories.read_bytes()).hexdigest()),
