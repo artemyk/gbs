@@ -1,5 +1,4 @@
 from dataclasses import asdict
-import itertools
 import hashlib
 import json
 
@@ -12,11 +11,11 @@ from gbs.cli import main
 from reference_transformer import Config, Transformer
 
 
-@pytest.fixture(params=list(itertools.product([False, True], [False, True])))
+@pytest.fixture(params=[False, True])
 def inputs(request, tmp_path):
     torch.manual_seed(5)
-    rope, bos_visible = request.param
-    teacher = Transformer(Config(rope=rope, bos_visible=bos_visible))
+    rope = request.param
+    teacher = Transformer(Config(rope=rope))
     checkpoint = tmp_path/"teacher.pt"
     torch.save(dict(config=asdict(teacher.cfg), model=teacher.state_dict()), checkpoint)
     roots = words(teacher.cfg.vocab, 3).to(torch.uint8)
@@ -52,6 +51,8 @@ def test_shared_fit_and_evaluate_commands(inputs, tmp_path):
     assert metadata["histories_sha256"] == hashlib.sha256((fitted/"histories.pt").read_bytes()).hexdigest()
     assert metadata["input_histories_sha256"] == hashlib.sha256(histories.read_bytes()).hexdigest()
     assert metadata["evaluation_seed"] == 1000
+    evaluation_metadata = json.loads((evaluated/"run.json").read_text())
+    assert evaluation_metadata["source_abstraction_sha256"] == hashlib.sha256((fitted/"abstraction.pt").read_bytes()).hexdigest()
     with pytest.raises(SystemExit):
         main(["fit", *common, "--output", str(fitted), "--config", str(config)])
 

@@ -12,7 +12,7 @@ from ..data import prepare_histories, token_ids
 
 
 class BeliefStateAdapter(CacheModel):
-    """Pre-LayerNorm transformer with configurable vocabulary, size, heads, and BOS.
+    """Pre-LayerNorm transformer with configurable vocabulary, size, and heads.
 
     State layout: flattened (position, layer, head, key/value, head coordinate),
     current-token coordinates (including BOS), and an explicit history length.
@@ -24,27 +24,26 @@ class BeliefStateAdapter(CacheModel):
         cfg = model.cfg
         if any(getattr(cfg, name, False) for name in ("attention_mass", "attention_sums")):
             raise ValueError("Only standard softmax attention is supported")
+        if not getattr(cfg, "bos_visible", True):
+            raise ValueError("Only standard BOS is supported")
         self.model = model.eval().requires_grad_(False)
         self.vocab_size, self.n_layers = cfg.vocab, cfg.n_layers
         self.n_heads, self.head_dim = cfg.n_heads, cfg.d_head
         self.token_features = cfg.vocab + 1
         self.max_history = cfg.context
-        self.bos_visible = getattr(cfg, "bos_visible", True)
         self.rope = cfg.rope
         self.entry_width = self.n_layers*self.n_heads*2*self.head_dim
         if self.dtype not in [torch.float32, torch.float64]:
             raise ValueError("This adapter currently supports float32 and float64 teachers")
 
     @classmethod
-    def from_checkpoint(cls, checkpoint, *, device="cpu", bos_visible=None):
+    def from_checkpoint(cls, checkpoint, *, device="cpu"):
         """Load upstream's config + model state dictionary; no source checkout needed.
 
         The checkpoint contains tensors and ordinary Python data and is loaded
         with weights_only=True. Unknown model fields or mismatched parameter
         names/shapes raise errors rather than silently changing the architecture.
-        BOS is visible by default. For historical masked-BOS checkpoints missing
-        that setting, pass bos_visible=False. An explicit checkpoint setting
-        cannot be overridden with a conflicting value.
+        BOS is always included in attention.
         """
         saved = torch.load(checkpoint, map_location="cpu", weights_only=True)
         if not isinstance(saved, dict) or not {"config", "model"} <= saved.keys():
@@ -54,10 +53,8 @@ class BeliefStateAdapter(CacheModel):
         for name in ("attention_mass", "attention_sums"):
             if config.pop(name, False):
                 raise ValueError("Only standard softmax attention is supported")
-        if bos_visible is not None:
-            if "bos_visible" in config and config["bos_visible"] != bos_visible:
-                raise ValueError("bos_visible conflicts with the checkpoint configuration")
-            config["bos_visible"] = bos_visible
+        if config.pop("bos_visible", True) is not True:
+            raise ValueError("Only standard BOS is supported")
         model = Transformer(Config(**config))
         model.to(dtype=saved["model"]["embed.weight"].dtype)
         model.load_state_dict(saved["model"])
@@ -70,7 +67,7 @@ class BeliefStateAdapter(CacheModel):
 
     def spec(self):
         # Keep standard-teacher identity stable for saved abstraction checkpoints.
-        config = dict(attention_mass=False, attention_sums=False, bos_visible=self.bos_visible)
+        config = dict(attention_mass=False, attention_sums=False, bos_visible=True)
         config.update(asdict(self.model.cfg))
         return dict(**super().spec(), layout="kv-token-length-v1", config=config)
 
@@ -83,8 +80,7 @@ class BeliefStateAdapter(CacheModel):
         if not bool((positions == positions[0]).all()) or not bool((positions == positions.round()).all()):
             raise ValueError("Batch states must share an integer history length")
         n = int(positions[0])
-        expected = max(n-1, 0) + int(self.bos_visible and n > 0)
-        if kv.shape[1] != expected:
+        if kv.shape[1] != n:
             raise ValueError("Cache length and history-length metadata disagree")
         return kv[..., 0, :], kv[..., 1, :], states[:, width:-1], n
 
@@ -109,8 +105,6 @@ class BeliefStateAdapter(CacheModel):
         if n == 0:
             return start
         _, keys, values, _ = self._pass(start, histories)
-        if not self.bos_visible:
-            keys, values = keys[:, 1:], values[:, 1:]
         return self._pack(keys, values, F.one_hot(histories[:, -1], self.token_features).to(self.dtype), n)
 
     def _pass(self, states, tokens):
@@ -122,14 +116,10 @@ class BeliefStateAdapter(CacheModel):
         x = torch.cat([(current @ self.model.embed.weight)[:, None], self.model.embed(tokens[:, :-1])], 1)
         if self.model.pos_embed is not None:
             x = x + self.model.pos_embed(positions)
-        past = keys.shape[1]
-        mask = torch.arange(past+horizon, device=states.device)[None] <= past+torch.arange(horizon, device=states.device)[:, None]
-        if n == 0 and not self.bos_visible:
-            mask[1:, 0] = False
         all_k, all_v = [], []
         for layer, block in enumerate(self.model.blocks):
             cache = (keys[:, :, layer].transpose(1, 2), values[:, :, layer].transpose(1, 2))
-            x, _, (k, v) = block(x, mask, positions=positions, cache=cache)
+            x, _, (k, v) = block(x, positions=positions, cache=cache)
             all_k.append(k.transpose(1, 2))
             all_v.append(v.transpose(1, 2))
         return self.model.unembed(self.model.ln_final(x)).log_softmax(-1), torch.stack(all_k, 2), torch.stack(all_v, 2), n
@@ -143,8 +133,6 @@ class BeliefStateAdapter(CacheModel):
         if tokens.shape != (len(states),):
             raise ValueError("Provide one token per state")
         lp, keys, values, n = self._pass(states, tokens[:, None])
-        if n == 0 and not self.bos_visible:
-            keys, values = keys[:, 1:], values[:, 1:]
         return lp[:, 0], self._pack(keys, values, F.one_hot(tokens, self.token_features).to(states.dtype), n+1)
 
     @torch.no_grad()
@@ -156,8 +144,6 @@ class BeliefStateAdapter(CacheModel):
             lp, keys, values, n = self._pass(states, dummy)
             q = lp[:, 0].exp()
             token = (uniform[:, None] >= q.cumsum(1)).sum(1).clamp_max(self.vocab_size-1)
-            if n == 0 and not self.bos_visible:
-                keys, values = keys[:, 1:], values[:, 1:]
             states = self._pack(keys, values, F.one_hot(token, self.token_features).to(states.dtype), n+1)
             tokens.append(token)
             probabilities.append(q)
@@ -168,11 +154,9 @@ class BeliefStateAdapter(CacheModel):
         if len(tokens) != len(states):
             raise ValueError("Provide one continuation per state")
         lp, keys, values, n = self._pass(states, tokens)
-        past = (states.shape[1]-self.token_features-1)//self.entry_width
         successors = []
         for t in range(1, tokens.shape[1]+1):
-            start = int(n == 0 and not self.bos_visible)
-            k, v = keys[:, start:past+t], values[:, start:past+t]
+            k, v = keys[:, :n+t], values[:, :n+t]
             successors.append(self._pack(k, v, F.one_hot(tokens[:, t-1], self.token_features).to(states.dtype), n+t))
         return lp, successors
 

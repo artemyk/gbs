@@ -10,7 +10,7 @@ from reference_transformer import Config, make_model
 
 @pytest.mark.parametrize('rope', [False, True])
 def test_learned_prefix_queries_update_and_saved_abstraction_preserves_predictions(rope, tmp_path):
-    adapter = BeliefStateAdapter(make_model(Config(rope=rope, bos_visible=True)).double())
+    adapter = BeliefStateAdapter(make_model(Config(rope=rope)).double())
     parents = words(3, 5)
     train, valid = parents[:100], parents[100:120]
     config = DecoderConfig(dimension=2, queries_per_head=3, hidden=8, decoder_steps=20,
@@ -76,7 +76,7 @@ def test_prefix_domain_and_parent_split_validation():
 def test_full_fit_anchors_prefixes_with_learned_queries():
     from gbs import FitConfig, fit_abstraction
     torch.manual_seed(5)
-    adapter = BeliefStateAdapter(make_model(Config(bos_visible=True)).double())
+    adapter = BeliefStateAdapter(make_model(Config()).double())
     roots = words(3, 3)
     result = fit_abstraction(adapter, roots[:15], roots[15:],
         initializer=lambda h: h.double().sum(1, keepdim=True), config=FitConfig(
@@ -99,3 +99,41 @@ def test_invalid_decoder_settings_fail_before_teacher_preparation(field, value):
     with pytest.raises(ValueError, match=field):
         config = DecoderConfig(**{field: value})
         fit_decoder(None, None, None, None, config=config, progress=None)
+
+
+def test_decoder_rejects_overflowing_training_loss_from_finite_targets():
+    adapter = BeliefStateAdapter(make_model(Config(vocab=2)))
+    parents = words(2, 3)
+    with pytest.raises(ValueError, match='Nonfinite decoder training loss'):
+        fit_decoder(adapter, parents[:4], parents[4:],
+            lambda h: torch.full((len(h), 1), 2e38),
+            config=DecoderConfig(dimension=1, hidden=4, decoder_steps=1), progress=None)
+
+
+@pytest.mark.parametrize('score', [float('nan'), float('inf')])
+def test_decoder_rejects_nonfinite_validation_scores(score, monkeypatch):
+    from gbs.decoder import PrefixBank
+    monkeypatch.setattr(PrefixBank, 'measure', lambda *args: (score, {}))
+    adapter = BeliefStateAdapter(make_model(Config(vocab=2)))
+    parents = words(2, 3)
+    with pytest.raises(ValueError, match='Nonfinite decoder validation MSE'):
+        fit_decoder(adapter, parents[:4], parents[4:], lambda h: h.float().sum(1, keepdim=True),
+            config=DecoderConfig(dimension=1, hidden=4, decoder_steps=0), progress=None)
+
+
+def test_decoder_rejects_nonfinite_gradients_before_updating_weights(monkeypatch):
+    from gbs import AttentionDecoder
+    original = AttentionDecoder.forward
+    def invalid_gradient(decoder, *args):
+        if torch.is_grad_enabled():
+            decoder.net[-1].weight.register_hook(lambda gradient: torch.full_like(gradient, float('inf')))
+        return original(decoder, *args)
+    monkeypatch.setattr(AttentionDecoder, 'forward', invalid_gradient)
+    def unexpected_update(*args, **kwargs):
+        pytest.fail('Nonfinite gradients reached the optimizer')
+    monkeypatch.setattr(torch.optim.Adam, 'step', unexpected_update)
+    adapter = BeliefStateAdapter(make_model(Config(vocab=2)))
+    parents = words(2, 3)
+    with pytest.raises(RuntimeError, match='non-finite'):
+        fit_decoder(adapter, parents[:4], parents[4:], lambda h: h.float().sum(1, keepdim=True),
+            config=DecoderConfig(dimension=1, hidden=4, decoder_steps=1), progress=None)

@@ -19,7 +19,7 @@ from gbs.data import DEFAULT_EVALUATION_SEED, history_splits
 from gbs.runs import save_run
 
 
-DEMO_COMMIT = "301c2508a9994528b70dff07ac8017edd4c25d6f"
+DEMO_COMMIT = "5b5ffd193f73691d4be56f0248ffa84be459f33f"
 DEMO_URL = f"https://raw.githubusercontent.com/artemyk/belief-state/{DEMO_COMMIT}/runs/L4_d64_rope/eps0.05/s0.pt"
 DEMO_SHA256 = "b390e7ae52f318ab3f68793b9ac4b7dcfe5ae6cfbddb4654a8cbfa1c362e9400"
 

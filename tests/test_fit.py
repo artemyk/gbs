@@ -158,7 +158,7 @@ def test_cheap_joint_update_uses_current_codes_and_trains_both_maps_without_roll
     from gbs.fit import _joint_loss
     from reference_transformer import Config, make_model
     torch.manual_seed(17)
-    adapter = BeliefStateAdapter(make_model(Config(vocab=2, bos_visible=True)).double())
+    adapter = BeliefStateAdapter(make_model(Config(vocab=2)).double())
     bank = make_bank(adapter, words(2, 3), 2, seed=17)
     architecture = Architecture(2, 1, 4)
     decoder = AttentionDecoder(adapter, architecture)

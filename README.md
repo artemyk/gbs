@@ -45,14 +45,13 @@ python examples/belief_state.py --output outputs/rope-full --plot
 ```
 
 The demo downloads only the roughly 0.6 MB
-[checkpoint](https://github.com/artemyk/belief-state/blob/301c2508a9994528b70dff07ac8017edd4c25d6f/runs/L4_d64_rope/eps0.05/s0.pt),
-pinned to upstream commit `301c2508a9994528b70dff07ac8017edd4c25d6f`, and verifies
+[checkpoint](https://github.com/artemyk/belief-state/blob/5b5ffd193f73691d4be56f0248ffa84be459f33f/runs/L4_d64_rope/eps0.05/s0.pt),
+pinned to upstream commit `5b5ffd193f73691d4be56f0248ffa84be459f33f`, and verifies
 its SHA-256 checksum. It caches the file at
 `checkpoints/L4_d64_rope_bos_eps0.05_s0.pt`; subsequent runs reuse the verified file.
 No source checkout is needed. Use `--checkpoint path/to/model.pt` for a local
-checkpoint, including a visible-BOS RoPE model. The adapter supports standard
-softmax attention with RoPE or learned positions, optional visible BOS, and
-multiple heads.
+checkpoint. The adapter supports standard causal softmax attention with RoPE
+or learned positions and multiple heads. BOS is always visible.
 
 ### Checkpoint format
 
@@ -74,13 +73,8 @@ position options; unknown fields and mismatched weights raise errors. This
 loader is specific to the belief-state architecture; other model families use
 their own `CacheModel` adapter. The encoder and fitting code are shared.
 
-BOS is visible by default, including when older standard-BOS checkpoints omit
-`bos_visible`. New belief-state checkpoints record this setting in `config`.
-An explicit `bos_visible=False` preserves a masked-BOS model. For historical
-masked-BOS files that omit the setting, load them with
-`BeliefStateAdapter.from_checkpoint(path, bos_visible=False)`. Conflicting
-explicit settings are rejected. The demo's visible-BOS cache filename is
-distinct from the historical masked-BOS download.
+BOS is always visible to subsequent tokens. There is no BOS-visibility option.
+Checkpoints that explicitly request a different attention rule are rejected.
 
 Ordinary sequences and cached continuations use the same `Block.forward`
 computation. The adapter handles flat-state packing, token coordinates, and
@@ -139,11 +133,12 @@ pass `--config fit.json` with:
 
 Each command requires a new output directory and records test metrics, input
 hashes, teacher identity, the history splits, numerical library versions, and
-the evaluation seed. The fit command also saves the abstraction,
+the evaluation seed. Evaluation records the source abstraction hash as
+`source_abstraction_sha256`. The fit command also saves the abstraction,
 configuration, and validation trace. The same default evaluation seed is used
 across commands; set `--evaluation-seed` to change it. `--device` and `--threads`
 control execution. The commands call the shared Python fitting API below;
-there are no separate encoder or fitting branches for BOS and attention variants.
+all supported teachers use the same encoder and fitting procedure.
 Integer histories and tokens passed to `advance` or `trajectory` are validated
 and converted to `torch.long` before indexing;
 floating-point histories are rejected. The history hash in `run.json` identifies
@@ -257,8 +252,9 @@ coordinates in one shared basis.
 Decoder validation trace entries include elapsed seconds from the start of fitting,
 including query initialization and cache preparation.
 Configuration validation rejects nonfinite learning rates, loss weights, and
-sampling settings before preparing teacher data. Step counts, dimensions,
-and sampling counts must be integers in their documented ranges.
+sampling settings before preparing teacher data. Decoder regression stops if
+its training loss, validation MSE, or gradients become nonfinite. Step counts,
+dimensions, and sampling counts must be integers in their documented ranges.
 
 There are two predictive losses. **Single insertion** writes the root once and
 lets the teacher's cache grow along a continuation. **Repeated compression**
@@ -327,7 +323,7 @@ libraries.
 
 For the supplied adapter, state includes past KV entries, a current token, and
 explicit position metadata. With a length-16 history, the past cache has 15
-ordinary-token positions, plus a BOS entry when BOS is visible. The encoder
+ordinary-token positions, plus the BOS entry. The encoder
 writes every KV entry with the same affine map, including the BOS entry, and
 leaves only structural position metadata fixed. It writes
 post-position-encoding keys directly and uses a continuous token vector, so

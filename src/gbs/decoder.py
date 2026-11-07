@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import copy
+import math
 import time
 
 import numpy as np
@@ -150,6 +151,8 @@ def fit_decoder(adapter, train_sequences, validation_sequences, coordinates, *, 
     for step in range(config.decoder_steps+1):
         if step % config.validate_every == 0 or step == config.decoder_steps:
             score, _ = validation.measure(decoder, adapter)
+            if not math.isfinite(score):
+                raise ValueError("Nonfinite decoder validation MSE")
             trace.append(dict(stage='decoder', step=step, validation_mse=score, seconds=time.perf_counter()-started))
             if score < best:
                 best, state = score, copy.deepcopy(decoder.state_dict())
@@ -160,8 +163,13 @@ def fit_decoder(adapter, train_sequences, validation_sequences, coordinates, *, 
         optimizer.param_groups[0]['lr'] = config.decoder_lr*fraction
         x, y = training.sample(rng, config.batch_size)
         loss = (decoder(adapter, x)-y).square().mean()
+        if not bool(torch.isfinite(loss)):
+            raise ValueError("Nonfinite decoder training loss")
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        # Check gradients without changing their magnitude or the fitted schedule.
+        torch.nn.utils.clip_grad_norm_(decoder.parameters(), float("inf"),
+                                      norm_type=float("inf"), error_if_nonfinite=True)
         optimizer.step()
     decoder.load_state_dict(state)
     score, by_length = validation.measure(decoder, adapter)

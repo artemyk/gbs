@@ -12,7 +12,7 @@ from reference_transformer import Config, make_model
 @pytest.mark.parametrize("dtype", [torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8])
 def test_default_ghmm_fitting_accepts_all_supported_integer_history_types(dtype):
     torch.manual_seed(5)
-    adapter = BeliefStateAdapter(make_model(Config(bos_visible=True)))
+    adapter = BeliefStateAdapter(make_model(Config()))
     histories = words(3, 3).to(dtype)
     result = fit_abstraction(adapter, histories[:12], histories[12:20], config=FitConfig(
         dimension=1, queries_per_head=1, hidden=4, horizon=2, future_length=1,
@@ -24,7 +24,7 @@ def test_default_ghmm_fitting_accepts_all_supported_integer_history_types(dtype)
 @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS hardware required")
 def test_cpu_double_ghmm_initializes_an_mps_teacher():
     torch.manual_seed(5)
-    adapter = BeliefStateAdapter(make_model(Config(vocab=2, bos_visible=True))).to("mps")
+    adapter = BeliefStateAdapter(make_model(Config(vocab=2))).to("mps")
     initializer = GHMM(torch.tensor([[[.2, 0.], [.5, .7]], [[.8, 0.], [-.5, .3]]], dtype=torch.float64),
                        torch.tensor([1., .5], dtype=torch.float64))
     histories = words(2, 4)

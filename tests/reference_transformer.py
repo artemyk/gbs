@@ -15,7 +15,6 @@ class Config:
     d_head: int = 4
     d_mlp: int = 24
     rope: bool = True
-    bos_visible: bool = False
 
 
 def rotary(x, positions):
@@ -54,7 +53,6 @@ class Transformer(nn.Module):
         pos = torch.arange(n)
         if self.pos_embed is not None: x = x+self.pos_embed(pos)
         mask = torch.ones(n, n, dtype=torch.bool).tril()
-        if not cfg.bos_visible: mask[1:, 0] = False
         for block in self.blocks:
             q, k, v = block.qkv(block.ln1(x)).reshape(len(x), n, 3, cfg.n_heads, cfg.d_head).permute(2, 0, 3, 1, 4)
             if cfg.rope: q, k = rotary(q, pos), rotary(k, pos)

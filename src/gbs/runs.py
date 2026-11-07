@@ -11,7 +11,7 @@ from .data import DEFAULT_EVALUATION_SEED
 
 
 def save_run(directory, model, splits, *, teacher_checkpoint, horizon, evaluation_seed=DEFAULT_EVALUATION_SEED,
-             result=None, metadata=None, initial_abstraction=None):
+             result=None, metadata=None, source_abstraction=None):
     """Evaluate on test histories and save one consistent experiment record.
 
     ``result`` supplies fitted weights, configuration, and trace. Without it,
@@ -36,8 +36,8 @@ def save_run(directory, model, splits, *, teacher_checkpoint, horizon, evaluatio
         split_sizes={name: len(value) for name, value in splits.items()},
         horizon=horizon, evaluation_seed=evaluation_seed, device=str(model.adapter.device),
         threads=torch.get_num_threads(), torch_version=str(torch.__version__), numpy_version=np.__version__)
-    if initial_abstraction is not None:
-        record["initial_abstraction_sha256"] = hashlib.sha256(Path(initial_abstraction).read_bytes()).hexdigest()
+    if source_abstraction is not None:
+        record["source_abstraction_sha256"] = hashlib.sha256(Path(source_abstraction).read_bytes()).hexdigest()
     for name, value in [("run", record), ("test_metrics", metrics)]:
         (directory/f"{name}.json").write_text(json.dumps(value, indent=2)+"\n")
     return metrics

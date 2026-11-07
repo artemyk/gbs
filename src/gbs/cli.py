@@ -55,7 +55,7 @@ def main(argv=None):
         metrics = save_run(args.output, model, splits, teacher_checkpoint=args.teacher, horizon=horizon,
             evaluation_seed=args.evaluation_seed, result=result,
             metadata=dict(command=args.command, input_histories_sha256=hashlib.sha256(args.histories.read_bytes()).hexdigest()),
-            initial_abstraction=None if args.command == "fit" else args.abstraction)
+            source_abstraction=None if args.command == "fit" else args.abstraction)
         print(json.dumps(metrics, indent=2), flush=True)
     except (ValueError, TypeError, FileNotFoundError, FileExistsError) as error:
         parser.error(str(error))

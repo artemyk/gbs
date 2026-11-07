@@ -1,7 +1,7 @@
 """Checkpoint architecture from artemyk/belief-state (MIT, Artemy Kolchinsky).
 
 The parameter names match upstream state dictionaries. Attention is standard
-softmax attention, with RoPE or learned positions and optional visible BOS.
+softmax attention, with RoPE or learned positions and a standard BOS token.
 """
 from dataclasses import dataclass
 
@@ -20,7 +20,6 @@ class Config:
     d_head: int = 8
     d_mlp: int = 256
     rope: bool = False
-    bos_visible: bool = True
 
     def __post_init__(self):
         dimensions = [self.vocab, self.context, self.d_model, self.n_layers, self.n_heads, self.d_head, self.d_mlp]
@@ -49,13 +48,12 @@ class Block(nn.Module):
         self.ln2 = nn.LayerNorm(cfg.d_model)
         self.mlp = nn.Sequential(nn.Linear(cfg.d_model, cfg.d_mlp), nn.ReLU(), nn.Linear(cfg.d_mlp, cfg.d_model))
 
-    def forward(self, x, mask=None, *, positions=None, cache=None):
+    def forward(self, x, *, positions=None, cache=None):
         """Run a full sequence or continue a cache through the same block math.
 
         Keys and values have shape (batch, heads, positions, head_dim); cached
         keys already include RoPE. Return residuals, normalized inputs, and the
         extended (keys, values), preserving gradients through the supplied cache.
-        Explicit positions support historical caches whose BOS was omitted.
         """
         normalized = self.ln1(x)
         batch, length, _ = x.shape
@@ -67,7 +65,8 @@ class Block(nn.Module):
             q, k = rotate(q, positions), rotate(k, positions)
         if cache is not None:
             k, v = torch.cat([cache[0], k], 2), torch.cat([cache[1], v], 2)
-        if mask is None and past:
+        mask = None
+        if past:
             mask = torch.arange(past+length, device=x.device)[None] <= past+torch.arange(length, device=x.device)[:, None]
         attention = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=mask is None)
         x = x+self.out(attention.transpose(1, 2).flatten(2))
@@ -91,12 +90,9 @@ class Transformer(nn.Module):
         x = self.embed(inputs)
         if self.pos_embed is not None:
             x = x+self.pos_embed(torch.arange(tokens.shape[1], device=tokens.device))
-        mask = torch.ones(tokens.shape[1], tokens.shape[1], dtype=torch.bool, device=tokens.device).tril()
-        if not self.cfg.bos_visible:
-            mask[1:, 0] = False
         normalized = []
         for block in self.blocks:
-            x, block_input, _ = block(x, mask)
+            x, block_input, _ = block(x)
             normalized.append(block_input)
         final = self.ln_final(x)
         logits = self.unembed(final)
