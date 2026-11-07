@@ -1,149 +1,185 @@
-"""Convert belief-state RoPE weights into an unmodified Hugging Face model."""
+"""Adapter for the architecture in github.com/artemyk/belief-state."""
 from __future__ import annotations
 
-import hashlib
-import json
+from dataclasses import asdict
+
 import torch
+import torch.nn.functional as F
+
+from .base import CacheModel
+from ._belief_state_model import Config, Transformer, attention_projection, rotate
+from ..data import prepare_histories
 
 
-def _source_fingerprint(config, weights):
-    spec = dict(adapter="BeliefStateAdapter", vocab=config["vocab"], layers=config["n_layers"],
-        heads=config["n_heads"], head_dim=config["d_head"], token_features=config["vocab"]+1,
-        max_history=config["context"], layout="kv-token-length-v1",
-        config=dict(attention_mass=False, attention_sums=False, **config))
-    digest = hashlib.sha256(json.dumps(spec, sort_keys=True).encode())
-    for name, value in sorted(weights.items()):
-        value = value.detach().cpu().contiguous()
-        digest.update(f"model.{name}:{value.dtype}:{tuple(value.shape)}".encode())
-        digest.update(value.reshape(-1).view(torch.uint8).numpy().tobytes())
-    return digest.hexdigest()
+class BeliefStateAdapter(CacheModel):
+    """Pre-LayerNorm transformer with configurable vocabulary, size, heads, and BOS.
 
-
-def convert_belief_state_checkpoint(checkpoint, *, attn_implementation="sdpa"):
-    """Return a native Starcoder2ForCausalLM with equivalent ordinary-token logits.
-
-    No transformer forward pass is implemented here. The conversion splits QKV
-    projections, copies LayerNorm/ReLU MLP weights, and absorbs output bias into
-    the final LayerNorm bias. A native head_dim preserves narrow heads.
-    The input-only BOS is excluded from the modeled output alphabet through
-    configuration metadata read by TransformersAdapter. Save with the model's
-    normal save_pretrained method for a standard config/safetensors folder.
-    Learned-position teachers should be supplied as native HF checkpoints.
+    State layout: flattened (position, layer, head, key/value, head coordinate),
+    current-token coordinates (including BOS), and an explicit history length.
+    Length is fixed by the encoder, never inferred from a relaxed token vector.
+    This handles empty history separately from the first real token correctly.
     """
-    from transformers import Starcoder2Config, Starcoder2ForCausalLM
-
-    saved = torch.load(checkpoint, map_location="cpu", weights_only=True)
-    if not isinstance(saved, dict) or not {"config", "model"} <= saved.keys():
-        raise ValueError("Expected a belief-state checkpoint with config and model state dictionary")
-    config = dict(saved["config"])
-    for key in ("attention_mass", "attention_sums"):
-        if config.pop(key, False):
+    def __init__(self, model):
+        super().__init__()
+        cfg = model.cfg
+        if any(getattr(cfg, name, False) for name in ("attention_mass", "attention_sums")):
             raise ValueError("Only standard softmax attention is supported")
-    defaults = dict(vocab=2, context=32, d_model=64, n_layers=4, n_heads=1,
-                    d_head=8, d_mlp=256, rope=False, bos_visible=False)
-    if config.keys()-defaults.keys():
-        raise ValueError(f"Unknown architecture fields: {sorted(config.keys()-defaults.keys())}")
-    c = defaults | config
-    if not c["rope"]:
-        raise ValueError("The belief-state converter supports RoPE; use a native HF checkpoint for learned positions")
-    native = Starcoder2Config(vocab_size=c["vocab"]+1, hidden_size=c["d_model"],
-        intermediate_size=c["d_mlp"], num_hidden_layers=c["n_layers"],
-        num_attention_heads=c["n_heads"], num_key_value_heads=c["n_heads"], head_dim=c["d_head"],
-        hidden_act="relu", max_position_embeddings=c["context"], norm_epsilon=1e-5,
-        rope_parameters={"rope_type": "default", "rope_theta": 10000.},
-        bos_token_id=c["vocab"], eos_token_id=None, tie_word_embeddings=False,
-        attention_dropout=0., residual_dropout=0., embedding_dropout=0., use_bias=True)
-    native.gbs = dict(token_ids=list(range(c["vocab"])), attend_to_bos=c["bos_visible"],
-                      source_fingerprint=_source_fingerprint(c, saved["model"]))
-    model = Starcoder2ForCausalLM(native).to(dtype=saved["model"]["embed.weight"].dtype)
-    model.set_attn_implementation(attn_implementation)
-    source = dict(saved["model"])
+        self.model = model.eval().requires_grad_(False)
+        self.vocab_size, self.n_layers = cfg.vocab, cfg.n_layers
+        self.n_heads, self.head_dim = cfg.n_heads, cfg.d_head
+        self.token_features = cfg.vocab + 1
+        self.max_history = cfg.context
+        self.bos_visible = getattr(cfg, "bos_visible", False)
+        self.rope = cfg.rope
+        self.entry_width = self.n_layers*self.n_heads*2*self.head_dim
+        if self.dtype not in [torch.float32, torch.float64]:
+            raise ValueError("This adapter currently supports float32 and float64 teachers")
 
-    def take(name):
-        try:
-            return source.pop(name)
-        except KeyError as error:
-            raise ValueError(f"Missing transformer weight: {name}") from error
+    @classmethod
+    def from_checkpoint(cls, checkpoint, *, device="cpu"):
+        """Load upstream's config + model state dictionary; no source checkout needed.
 
-    def linear(destination, prefix):
-        destination.weight.copy_(take(prefix+".weight"))
-        destination.bias.copy_(take(prefix+".bias"))
+        The checkpoint contains tensors and ordinary Python data and is loaded
+        with weights_only=True. Unknown model fields or mismatched parameter
+        names/shapes raise errors rather than silently changing the architecture.
+        """
+        saved = torch.load(checkpoint, map_location="cpu", weights_only=True)
+        if not isinstance(saved, dict) or not {"config", "model"} <= saved.keys():
+            raise ValueError("Expected a belief-state checkpoint with config and model state dictionary")
+        config = dict(saved["config"])
+        # Standard upstream checkpoints can contain inactive experimental flags.
+        for name in ("attention_mass", "attention_sums"):
+            if config.pop(name, False):
+                raise ValueError("Only standard softmax attention is supported")
+        model = Transformer(Config(**config))
+        model.to(dtype=saved["model"]["embed.weight"].dtype)
+        model.load_state_dict(saved["model"])
+        return cls(model).to(device)
 
-    with torch.no_grad():
-        model.model.embed_tokens.weight.copy_(take("embed.weight"))
-        for i, layer in enumerate(model.model.layers):
-            prefix = f"blocks.{i}."
-            linear(layer.input_layernorm, prefix+"ln1")
-            linear(layer.post_attention_layernorm, prefix+"ln2")
-            linear(layer.mlp.c_fc, prefix+"mlp.0")
-            linear(layer.mlp.c_proj, prefix+"mlp.2")
-            linear(layer.self_attn.o_proj, prefix+"out")
-            weight = take(prefix+"qkv.weight").reshape(3, -1, c["d_model"])
-            bias = take(prefix+"qkv.bias").reshape(3, -1)
-            for index, projection in enumerate((layer.self_attn.q_proj, layer.self_attn.k_proj, layer.self_attn.v_proj)):
-                projection.weight.copy_(weight[index])
-                projection.bias.copy_(bias[index])
-        model.model.norm.weight.copy_(take("ln_final.weight"))
-        final_bias, output_weight, output_bias = take("ln_final.bias"), take("unembed.weight"), take("unembed.bias")
-        shift = torch.linalg.lstsq(output_weight.double(), output_bias.double(), rcond=1e-10).solution
-        if not torch.allclose(output_weight.double()@shift, output_bias.double(), atol=1e-8, rtol=1e-6):
-            raise ValueError("The output bias cannot be represented by the native bias-free LM head")
-        model.model.norm.bias.copy_(final_bias+shift.to(final_bias))
-        model.lm_head.weight[:c["vocab"]].copy_(output_weight)
-        model.lm_head.weight[c["vocab"]:].zero_()
-    if source:
-        raise ValueError(f"Unexpected transformer weights: {sorted(source)}")
-    model.generation_config.suppress_tokens = [c["vocab"]]
-    return model.eval().requires_grad_(False)
+    def train(self, mode=True):
+        # Freezing parameters alone does not disable dropout in a custom teacher.
+        super().train(False)
+        return self
 
+    def spec(self):
+        # Keep standard-teacher identity stable for saved abstraction checkpoints.
+        config = dict(attention_mass=False, attention_sums=False, bos_visible=False)
+        config.update(asdict(self.model.cfg))
+        return dict(**super().spec(), layout="kv-token-length-v1", config=config)
 
-def convert_belief_state_abstraction(checkpoint, adapter):
-    """Port a fitted abstraction to the converted teacher's native cache/embedding layout.
+    def _unpack(self, states):
+        width = states.shape[1] - self.token_features - 1
+        if width < 0 or width % self.entry_width:
+            raise ValueError("Invalid packed cache width")
+        kv = states[:, :width].reshape(len(states), -1, self.n_layers, self.n_heads, 2, self.head_dim)
+        positions = states[:, -1].detach()
+        if not bool((positions == positions[0]).all()) or not bool((positions == positions.round()).all()):
+            raise ValueError("Batch states must share an integer history length")
+        n = int(positions[0])
+        expected = max(n-1, 0) + int(self.bos_visible and n > 0)
+        if kv.shape[1] != expected:
+            raise ValueError("Cache length and history-length metadata disagree")
+        return kv[..., 0, :], kv[..., 1, :], states[:, width:-1], n
 
-    The source checkpoint is left intact. Cache coordinates retain their order;
-    the token writer is composed with the embedding matrix, and the decoder's
-    first layer with its right inverse. No fitting is performed. This requires
-    an ordinary full-cache encoder and linearly independent token embeddings.
-    """
-    from ..models import Architecture, AttentionDecoder, AffineEncoder, GBSAbstraction
+    def _pack(self, keys, values, token, position):
+        kv = torch.stack([keys, values], -2).flatten(1)
+        return torch.cat([kv, token, token.new_full((len(token), 1), position)], 1)
 
-    saved = torch.load(checkpoint, map_location=adapter.device, weights_only=True)
-    source_id = getattr(adapter.model.config, "gbs", {}).get("source_fingerprint")
-    if source_id is None or saved["teacher_fingerprint"] != source_id:
-        raise ValueError("The source abstraction does not match the converted teacher")
-    fields = dict(saved["architecture"])
-    if not fields.pop("learn_queries", True):
-        raise ValueError("The source decoder must use learned queries")
-    architecture = Architecture(**fields)
-    decoder = AttentionDecoder(adapter, architecture)
-    old = saved["encoder"]
-    if not bool(old["writable"][:-1].all()) or bool(old["writable"][-1]):
-        raise ValueError("The source encoder must write the complete cache and token")
-    embedding = adapter.model.get_input_embeddings().weight.detach()
-    if len(embedding) != adapter.vocab_size+1 or torch.linalg.matrix_rank(embedding.double()) != len(embedding):
-        raise ValueError("Conversion requires independent ordinary-token and BOS embeddings")
-    token_width = len(embedding)
-    cache_width = len(old["mean"])-token_width-1
-    scale = old["scale"][:-1]
-    weight = scale[:, None]*old["linear.weight"]
-    bias = old["mean"][:-1]+scale*old["linear.bias"]
-    cache_weight, cache_bias = weight[:cache_width], bias[:cache_width]
-    if not adapter.attend_to_bos:
-        bos_state = adapter.history_state(torch.zeros(1, 1, dtype=torch.long, device=adapter.device))
-        cache_weight = torch.cat([weight.new_zeros(adapter.entry_width, architecture.dimension), cache_weight])
-        cache_bias = torch.cat([bos_state[0, :adapter.entry_width], cache_bias])
-    if cache_weight.shape[0] != int(old["mean"][-1])*adapter.entry_width:
-        raise ValueError("Source cache shape and history length disagree")
-    weight = torch.cat([cache_weight, embedding.T@weight[cache_width:]])
-    bias = torch.cat([cache_bias, embedding.T@bias[cache_width:]])
-    encoder = AffineEncoder(architecture.dimension, bias.new_zeros(len(bias)),
-        bias.new_ones(len(bias)), torch.ones(len(bias), device=bias.device, dtype=torch.bool))
-    parameters = dict(saved["decoder"])
-    readout = parameters["net.0.weight"]
-    inverse = torch.linalg.pinv(embedding.double(), rtol=1e-10).to(embedding)
-    parameters["net.0.weight"] = torch.cat([readout[:, :token_width]@inverse.T, readout[:, token_width:]], 1)
-    decoder.load_state_dict(parameters)
-    with torch.no_grad():
-        encoder.linear.weight.copy_(weight)
-        encoder.linear.bias.copy_(bias)
-    return GBSAbstraction(adapter, decoder, encoder, architecture).eval()
+    def encoder_mask(self, state):
+        mask = super().encoder_mask(state)
+        mask[-1] = False
+        return mask
+
+    def _qkv(self, block, x):
+        batch, length, _ = x.shape
+        q, k, v = block.qkv(block.ln1(x)).reshape(batch, length, 3, self.n_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        return q, k, v
+
+    @torch.no_grad()
+    def history_state(self, histories):
+        histories = prepare_histories(histories, self.vocab_size, device=self.device)
+        batch, n = histories.shape
+        if n > self.max_history:
+            raise ValueError("History exceeds context")
+        empty = self.model.embed.weight.new_empty(batch, 0, self.n_layers, self.n_heads, self.head_dim)
+        bos = F.one_hot(torch.full((batch,), self.vocab_size, device=self.device), self.token_features).to(self.dtype)
+        start = self._pack(empty, empty, bos, 0)
+        if n == 0:
+            return start
+        _, keys, values, _ = self._pass(start, histories)
+        if not self.bos_visible:
+            keys, values = keys[:, 1:], values[:, 1:]
+        return self._pack(keys, values, F.one_hot(histories[:, -1], self.token_features).to(self.dtype), n)
+
+    def _pass(self, states, tokens):
+        keys, values, current, n = self._unpack(states)
+        batch, horizon = tokens.shape
+        if horizon < 1 or n+horizon > self.max_history:
+            raise ValueError("Forecast must be nonempty and remain within the teacher context")
+        positions = n + torch.arange(horizon, device=states.device)
+        x = torch.cat([(current @ self.model.embed.weight)[:, None], self.model.embed(tokens[:, :-1])], 1)
+        if self.model.pos_embed is not None:
+            x = x + self.model.pos_embed(positions)
+        past = keys.shape[1]
+        mask = torch.arange(past+horizon, device=states.device)[None] <= past+torch.arange(horizon, device=states.device)[:, None]
+        if n == 0 and not self.bos_visible:
+            mask[1:, 0] = False
+        all_k, all_v = [], []
+        for layer, block in enumerate(self.model.blocks):
+            q, k, v = self._qkv(block, x)
+            if self.rope:
+                q, k = rotate(q, positions), rotate(k, positions)
+            k = torch.cat([keys[:, :, layer].transpose(1, 2), k], 2)
+            v = torch.cat([values[:, :, layer].transpose(1, 2), v], 2)
+            x = x + attention_projection(block, q, k, v, mask)
+            x = x + block.mlp(block.ln2(x))
+            all_k.append(k.transpose(1, 2))
+            all_v.append(v.transpose(1, 2))
+        return self.model.unembed(self.model.ln_final(x)).log_softmax(-1), torch.stack(all_k, 2), torch.stack(all_v, 2), n
+
+    def predict(self, states):
+        tokens = torch.zeros(len(states), 1, dtype=torch.long, device=states.device)
+        return self._pass(states, tokens)[0][:, 0]
+
+    def advance(self, states, tokens):
+        lp, keys, values, n = self._pass(states, tokens[:, None])
+        if n == 0 and not self.bos_visible:
+            keys, values = keys[:, 1:], values[:, 1:]
+        return lp[:, 0], self._pack(keys, values, F.one_hot(tokens, self.token_features).to(states.dtype), n+1)
+
+    @torch.no_grad()
+    def sample(self, states, uniforms):
+        """Sample using one teacher pass per token; cache construction precedes observation."""
+        tokens, probabilities = [], []
+        dummy = torch.zeros(len(states), 1, dtype=torch.long, device=states.device)
+        for uniform in uniforms.unbind(1):
+            lp, keys, values, n = self._pass(states, dummy)
+            q = lp[:, 0].exp()
+            token = (uniform[:, None] >= q.cumsum(1)).sum(1).clamp_max(self.vocab_size-1)
+            if n == 0 and not self.bos_visible:
+                keys, values = keys[:, 1:], values[:, 1:]
+            states = self._pack(keys, values, F.one_hot(token, self.token_features).to(states.dtype), n+1)
+            tokens.append(token)
+            probabilities.append(q)
+        return torch.stack(tokens, 1), torch.stack(probabilities, 1)
+
+    def trajectory(self, states, tokens):
+        lp, keys, values, n = self._pass(states, tokens)
+        past = (states.shape[1]-self.token_features-1)//self.entry_width
+        successors = []
+        for t in range(1, tokens.shape[1]+1):
+            start = int(n == 0 and not self.bos_visible)
+            k, v = keys[:, start:past+t], values[:, start:past+t]
+            successors.append(self._pack(k, v, F.one_hot(tokens[:, t-1], self.token_features).to(states.dtype), n+t))
+        return lp, successors
+
+    def features(self, states, queries):
+        keys, values, token, n = self._unpack(states)
+        count = keys.shape[1]
+        if count:
+            q = rotate(queries, n) if self.rope else queries
+            scores = torch.einsum("lhqd,btlhd->blhqt", q, keys) * self.head_dim**-.5
+            response = torch.einsum("blhqt,btlhd->blhqd", scores.softmax(-1), values).flatten(1)
+        else:
+            response = states.new_zeros(len(states), queries.numel())
+        return torch.cat([token, response], 1)

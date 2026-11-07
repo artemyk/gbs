@@ -1,4 +1,4 @@
-"""Shared fitting and evaluation commands for native Hugging Face checkpoints."""
+"""Shared fit, refinement, and evaluation commands for belief-state checkpoints."""
 from __future__ import annotations
 
 import argparse
@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 import torch
 
-from .adapters import TransformersAdapter
+from .adapters import BeliefStateAdapter
 from .data import DEFAULT_EVALUATION_SEED, history_splits
 from .fit import FitConfig, RefineConfig, fit_abstraction, refine_encoder
 from .models import GBSAbstraction
@@ -19,7 +19,7 @@ def main(argv=None):
     commands = parser.add_subparsers(dest="command", required=True)
     for name in ["fit", "refine", "evaluate"]:
         command = commands.add_parser(name)
-        command.add_argument("--teacher", type=Path, required=True, help="Native Hugging Face model directory or belief-state RoPE checkpoint")
+        command.add_argument("--teacher", type=Path, required=True, help="Transformer config + state-dictionary checkpoint")
         command.add_argument("--histories", type=Path, required=True, help="Tensor dictionary containing train/validation/test histories")
         command.add_argument("--output", type=Path, required=True, help="New output directory")
         command.add_argument("--device", choices=["cpu", "mps", "cuda"], default="cpu")
@@ -38,7 +38,7 @@ def main(argv=None):
         if args.threads < 1:
             raise ValueError("threads must be positive")
         torch.set_num_threads(args.threads)
-        adapter = TransformersAdapter.from_checkpoint(args.teacher, device=args.device)
+        adapter = BeliefStateAdapter.from_checkpoint(args.teacher, device=args.device)
         if args.command == "evaluate":
             config, horizon = None, args.horizon
         else:

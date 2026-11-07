@@ -3,14 +3,14 @@ import numpy as np
 import pytest
 import torch
 
-from gbs import AffineEncoder, TransformersAdapter, DecoderConfig, GBSAbstraction, fit_decoder
+from gbs import AffineEncoder, BeliefStateAdapter, DecoderConfig, GBSAbstraction, fit_decoder
 from gbs.adapters import words
-from native_transformer import make_model, native_log_probs
+from reference_transformer import Config, Transformer
 
 
 @pytest.mark.parametrize('rope', [False, True])
 def test_learned_prefix_queries_update_and_saved_abstraction_preserves_predictions(rope, tmp_path):
-    adapter = TransformersAdapter(make_model(rope=rope, bos_visible=True).double())
+    adapter = BeliefStateAdapter(Transformer(Config(rope=rope, bos_visible=True)).double())
     parents = words(3, 5)
     train, valid = parents[:100], parents[100:120]
     config = DecoderConfig(dimension=2, queries_per_head=3, hidden=8, decoder_steps=20,
@@ -40,14 +40,14 @@ def test_learned_prefix_queries_update_and_saved_abstraction_preserves_predictio
 
 
 def test_learned_prefix_preparation_uses_bounded_batches():
-    class CountingAdapter(TransformersAdapter):
+    class CountingAdapter(BeliefStateAdapter):
         def __init__(self, model):
             super().__init__(model)
             self.batches = []
         def history_state(self, histories):
             self.batches.append(len(histories))
             return super().history_state(histories)
-    adapter = CountingAdapter(make_model(vocab=2))
+    adapter = CountingAdapter(Transformer(Config(vocab=2)))
     parents = words(2, 4)
     result = fit_decoder(adapter, parents[:8], parents[8:], lambda h: h.float().sum(1, keepdim=True),
         config=DecoderConfig(dimension=1, queries_per_head=2, hidden=4, decoder_steps=0,
@@ -58,7 +58,7 @@ def test_learned_prefix_preparation_uses_bounded_batches():
 
 
 def test_prefix_domain_and_parent_split_validation():
-    adapter = TransformersAdapter(make_model())
+    adapter = BeliefStateAdapter(Transformer(Config()))
     parents = words(3, 3)
     target = lambda h: h.float().sum(1, keepdim=True)
     with pytest.raises(ValueError, match='overlap'):
@@ -76,7 +76,7 @@ def test_prefix_domain_and_parent_split_validation():
 def test_full_fit_anchors_prefixes_with_learned_queries():
     from gbs import FitConfig, fit_abstraction
     torch.manual_seed(5)
-    adapter = TransformersAdapter(make_model(bos_visible=True).double())
+    adapter = BeliefStateAdapter(Transformer(Config(bos_visible=True)).double())
     roots = words(3, 3)
     result = fit_abstraction(adapter, roots[:15], roots[15:],
         initializer=lambda h: h.double().sum(1, keepdim=True), config=FitConfig(encoder_refine_steps=0, joint_refine_steps=0,
@@ -88,8 +88,7 @@ def test_full_fit_anchors_prefixes_with_learned_queries():
     assert set(joint[-1]['validation_coordinate_by_length']) == {str(n) for n in range(6)}
     assert np.isfinite(joint[-1]['validation_loss'])
     assert result.abstraction.decoder.queries.requires_grad
-    cache, _ = adapter.cache_from_state(result.abstraction.encoder.mean[None])
-    assert cache.get_seq_length() == 3
+    assert result.abstraction.encoder.mean[-1] == 3
 
 
 @pytest.mark.parametrize('field,value', [('decoder_lr', float('nan')),

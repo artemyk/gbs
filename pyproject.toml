@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 authors = [{name = "Artemy Kolchinsky"}]
-dependencies = ["torch>=2.6", "numpy>=1.24", "transformers>=5.20,<6"]
+dependencies = ["torch>=2.2", "numpy>=1.24"]
 
 [project.scripts]
 gbs = "gbs.cli:main"

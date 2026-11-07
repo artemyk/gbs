@@ -3,11 +3,11 @@ import copy
 import pytest
 import torch
 
-from gbs import (AffineEncoder, Architecture, AttentionDecoder, TransformersAdapter,
+from gbs import (AffineEncoder, Architecture, AttentionDecoder, BeliefStateAdapter,
                  FitConfig, GBSAbstraction, GHMM, RefineConfig, fit_abstraction, refine_encoder)
 from gbs.adapters import words
 from gbs.fit import conditional_kl
-from native_transformer import make_model, native_log_probs
+from reference_transformer import Config, Transformer
 
 
 @pytest.mark.parametrize("steps", [0, 2])
@@ -16,15 +16,12 @@ def test_refinement_keeps_a_fallback_when_exact_prediction_kl_rounds_negative(st
     biases = torch.randn(1000, 2)
     logp = biases.log_softmax(-1)
     bias = biases[int(conditional_kl(logp.exp(), logp).argmin())]
-    teacher = make_model(vocab=2, bos_visible=True)
+    teacher = Transformer(Config(vocab=2, bos_visible=True))
     with torch.no_grad():
-        teacher.model.norm.weight.zero_()
-        teacher.model.norm.bias.zero_()
-        teacher.model.norm.bias[0] = 1
-        teacher.lm_head.weight.zero_()
-        teacher.lm_head.weight[:2, 0].copy_(bias)
-    adapter = TransformersAdapter(teacher)
-    logp = native_log_probs(teacher, torch.zeros(1, 4, dtype=torch.long))
+        teacher.unembed.weight.zero_()
+        teacher.unembed.bias.copy_(bias)
+    adapter = BeliefStateAdapter(teacher)
+    logp = teacher(torch.zeros(1, 4, dtype=torch.long)).log_softmax(-1)
     assert conditional_kl(logp.exp(), logp).mean() < 0
     histories = words(2, 4)
     architecture = Architecture(1, 1, 4)
@@ -48,7 +45,7 @@ def test_refinement_keeps_a_fallback_when_exact_prediction_kl_rounds_negative(st
 @pytest.mark.parametrize("dtype", [torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8])
 def test_default_ghmm_fitting_accepts_all_supported_integer_history_types(dtype):
     torch.manual_seed(5)
-    adapter = TransformersAdapter(make_model(bos_visible=True))
+    adapter = BeliefStateAdapter(Transformer(Config(bos_visible=True)))
     histories = words(3, 3).to(dtype)
     result = fit_abstraction(adapter, histories[:12], histories[12:20], config=FitConfig(encoder_refine_steps=0, joint_refine_steps=0,
         dimension=1, queries_per_head=1, hidden=4, horizon=2, future_length=1,
@@ -60,7 +57,7 @@ def test_default_ghmm_fitting_accepts_all_supported_integer_history_types(dtype)
 @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS hardware required")
 def test_cpu_double_ghmm_initializes_an_mps_teacher():
     torch.manual_seed(5)
-    adapter = TransformersAdapter(make_model(vocab=2, bos_visible=True)).to("mps")
+    adapter = BeliefStateAdapter(Transformer(Config(vocab=2, bos_visible=True))).to("mps")
     initializer = GHMM(torch.tensor([[[.2, 0.], [.5, .7]], [[.8, 0.], [-.5, .3]]], dtype=torch.float64),
                        torch.tensor([1., .5], dtype=torch.float64))
     histories = words(2, 4)
@@ -78,6 +75,6 @@ def test_byte_tokens_are_valid_for_a_256_symbol_vocabulary():
 
 
 def test_fractional_histories_are_rejected_before_token_conversion():
-    adapter = TransformersAdapter(make_model())
+    adapter = BeliefStateAdapter(Transformer(Config()))
     with pytest.raises(ValueError, match="integer"):
         adapter.history_state(torch.tensor([[.1, 1.9]]))

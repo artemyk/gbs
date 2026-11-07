@@ -15,8 +15,7 @@ hidden states or exact Bayesian beliefs.
 
 ## Install and test
 
-Requires Python 3.10 or later, PyTorch 2.6+, NumPy, and Transformers 5.20+.
-From this repository:
+Requires Python 3.10 or later, PyTorch, and NumPy. From this repository:
 
 ```sh
 python -m pip install -e '.[test,demo]'
@@ -27,62 +26,10 @@ The import name is `gbs`; the distribution name is `generalized-belief-states`.
 The `demo` extra adds Matplotlib for optional geometry plots. This repository
 does not include pretrained transformer weights or publish a PyPI release.
 
-## Native Hugging Face models and caches
-
-Transformer execution uses unmodified Hugging Face causal LMs and their
-[`DynamicCache`](https://huggingface.co/docs/transformers/en/kv_cache), with
-PyTorch SDPA as the default attention backend. There is no transformer forward
-implementation in `gbs` and no separately stored position counter.
-
-```python
-from transformers import AutoModelForCausalLM
-from gbs import TransformersAdapter
-
-native_model = AutoModelForCausalLM.from_pretrained(
-    "path/to/local/model", attn_implementation="sdpa", dtype="auto",
-)
-teacher = TransformersAdapter(native_model)
-```
-
-The adapter supports full, uniform attention caches for Llama, Starcoder2,
-GPT-2, GPT-NeoX, and GPTBigCode on one device, including grouped-query attention.
-Sliding, hybrid, quantized, and state-space caches are not supported. A valid BOS token
-is required for the empty-history initial state; pass `bos_token_id` if the
-model configuration does not supply one. By default the modeled alphabet is
-the entire model vocabulary. Optional `token_ids` selects and renormalizes a
-restricted alphabet; the belief-state converter uses this for its input-only
-BOS. Token histories passed to the fitter then index this selected alphabet.
-Supply histories without padding or an already prepended BOS; the adapter
-supplies the initial BOS itself.
-
-The fitting representation flattens the native KV tensors followed
-by the current input embedding. Every numerical coordinate is writable. Cache
-size comes from the tensor shapes, and the native model determines the next
-position from its cache. To exchange states with normal Hugging Face calls:
-
-```python
-state = teacher.history_state(histories)
-past_key_values, current_embedding = teacher.cache_from_state(state)
-# past_key_values is a standard DynamicCache, not a gbs cache class.
-state = teacher.state_from_cache(past_key_values, current_embedding)
-```
-
-These operations preserve gradients. Each execution creates a fresh cache
-object, so updating it cannot mutate another stored fitting state. The encoder
-can replace a length-10 history with a representative length-16 cache; native
-execution continues from position 16. No position coordinate is stored or fed
-separately into the model. Context limits still apply.
-
-SDPA is an execution backend, not a guarantee of a speedup. Its fused kernels
-depend on hardware, dtype, and shapes. The adapter requires gradients through
-written caches and inputs; inference-only serving engines are not substitutes
-for this fitting path. Existing CUDA backends may be selected through
-`attn_implementation`; CPU tests exercise SDPA and eager attention.
-
 ## Demo: large RoPE models
 
-RoPE checkpoints from [artemyk/belief-state](https://github.com/artemyk/belief-state)
-are converted to a native Hugging Face Starcoder2 model when loaded. Start with its
+The supplied adapter supports the transformers in
+[artemyk/belief-state](https://github.com/artemyk/belief-state). Start with its
 four-layer, width-64 RoPE model, trained on MRRXOR with mixing probability 0.05:
 
 ```sh
@@ -102,8 +49,9 @@ pinned to upstream commit `61c2a5570ce7df8ca5a739b2ecc0a27716cea5c4`, and verifi
 its SHA-256 checksum. It caches the file at
 `checkpoints/L4_d64_rope_eps0.05_s0.pt`; subsequent runs reuse the verified file.
 No source checkout is needed. Use `--checkpoint path/to/model.pt` for a local
-RoPE checkpoint, including a visible-BOS model, or a native `save_pretrained`
-directory. Learned-position models use native Hugging Face checkpoints.
+checkpoint, including a visible-BOS RoPE model. The adapter supports standard
+softmax attention with RoPE or learned positions, optional visible BOS, and
+multiple heads.
 
 ### Checkpoint format
 
@@ -116,40 +64,14 @@ model `state_dict`, rather than a pickled model object:
 torch.save({"config": config_dict, "model": model.state_dict()}, "model.pt")
 ```
 
-`TransformersAdapter.from_checkpoint` accepts a native `save_pretrained`
-directory or a belief-state RoPE file. A file is read with
-`torch.load(..., weights_only=True, map_location="cpu")` and converted once in
-memory into the library's `Starcoder2ForCausalLM`, preserving narrow head sizes,
-LayerNorm, ReLU MLPs, and standard softmax attention. The output bias is absorbed
-into final LayerNorm bias when algebraically representable. Unsupported fields,
-missing weights, and incompatible output biases fail explicitly. No remote
-Python source is executed.
-
-The converted model can be saved normally:
-
-```python
-from gbs import convert_belief_state_checkpoint
-
-native_model = convert_belief_state_checkpoint("teacher.pt")
-native_model.save_pretrained("checkpoints/native-teacher")
-```
-
-For an existing decoder/encoder fit, convert its state parameterization too:
-
-```python
-from gbs import convert_belief_state_abstraction
-
-teacher = TransformersAdapter.from_checkpoint("checkpoints/native-teacher")
-model = convert_belief_state_abstraction("old-fit/abstraction.pt", teacher)
-model.save("native-abstraction.pt")
-```
-
-This maps the old token writer into input embeddings and transforms the
-corresponding decoder readout; it does not retrain the fit or overwrite source
-checkpoints. New native fits use the same generic encoder and decoder. A
-historical masked-BOS teacher retains its BOS entry in the standard cache and
-uses the native model's attention-mask input, so cache length still determines
-position without an additional counter.
+The loader reads `config` and `model`, constructs the supported architecture
+included in this package, and loads weights strictly with
+`torch.load(..., weights_only=True, map_location="cpu")`. Training metadata in
+the checkpoint is ignored. There is no format conversion or remote Python
+source execution. Configurations must specify all trained attention and
+position options; unknown fields and mismatched weights raise errors. This
+loader is specific to the belief-state architecture; other model families use
+their own `CacheModel` adapter. The encoder and fitting code are shared.
 
 The demo samples length-16 MRRXOR histories. Distinct histories are assigned to
 disjoint training, validation, and test sets, retaining each history's sampling
@@ -157,8 +79,8 @@ multiplicity within its split. Only tokens enter the fitter. Continuations and
 prediction targets come from the transformer. `--epsilon` controls the history
 distribution and should match the chosen experiment. `--device cpu`, `mps`, or
 `cuda` selects execution; spectral decompositions and initial least squares run
-on CPU in double precision. Tests cover float32 and float64 execution;
-accelerator-specific reduced-precision kernels require matching model support.
+on CPU in double precision. Transformer execution currently supports float32
+and float64.
 
 Outputs include:
 
@@ -185,16 +107,15 @@ prediction-accuracy threshold is assumed by the fitter.
 ## Shared experiment commands
 
 Use the same commands for every supported teacher configuration. Supply a
-native model directory (or belief-state RoPE checkpoint) and a `histories.pt`
-dictionary with disjoint `train`, `validation`, and `test` integer tensors.
-The demo saves a file in this format. Optional JSON
+checkpoint and a `histories.pt` dictionary with disjoint `train`, `validation`,
+and `test` integer tensors. The demo saves a file in this format. Optional JSON
 configuration files contain fields of `FitConfig` or `RefineConfig`.
 
 ```sh
-python -m gbs fit --teacher checkpoints/native-teacher --histories histories.pt --output outputs/fit
-python -m gbs refine --teacher checkpoints/native-teacher --histories histories.pt \
+python -m gbs fit --teacher model.pt --histories histories.pt --output outputs/fit
+python -m gbs refine --teacher model.pt --histories histories.pt \
   --abstraction outputs/fit/abstraction.pt --config refine.json --output outputs/refined
-python -m gbs evaluate --teacher checkpoints/native-teacher --histories histories.pt \
+python -m gbs evaluate --teacher model.pt --histories histories.pt \
   --abstraction outputs/refined/abstraction.pt --horizon 16 --output outputs/evaluation
 ```
 
@@ -220,10 +141,10 @@ the saved normalized splits; the CLI also records the original input-file hash.
 
 ```python
 import torch
-from gbs import TransformersAdapter, FitConfig, fit_abstraction, evaluate
+from gbs import BeliefStateAdapter, FitConfig, fit_abstraction, evaluate
 
-teacher = TransformersAdapter.from_checkpoint(
-    "checkpoints/native-teacher",
+teacher = BeliefStateAdapter.from_checkpoint(
+    "checkpoints/L4_d64_rope_eps0.05_s0.pt",
     device="cpu",
 )
 # Supply disjoint integer tensors (number_of_histories, history_length).
@@ -253,9 +174,8 @@ with torch.no_grad():
 ```
 
 `advance` returns predictions **before** consuming its token. `predict` and
-`advance` return normalized log probabilities over the selected modeled alphabet.
-Converted belief-state checkpoints exclude their input-only BOS.
-`advance` implements write, transformer update, then decode.
+`advance` return normalized log probabilities over ordinary tokens, excluding
+BOS. `advance` implements write, transformer update, then decode.
 
 ## Fitting procedure
 
@@ -439,7 +359,7 @@ validation-selected improvement, with its configuration and validation trace.
 ## Other transformers and initializations
 
 The fitting code depends on `CacheModel`, not a particular transformer class.
-The included `TransformersAdapter` provides a concrete implementation. To use
+The included `BeliefStateAdapter` provides a concrete implementation. To use
 another architecture, implement:
 
 - `history_state(histories)`: natural flat floating states for equal-length
@@ -456,12 +376,15 @@ Keep the teacher in evaluation mode, with gradients disabled on its parameters.
 This is an adapter interface, not an automatic loader for arbitrary transformer
 libraries.
 
-The encoder writes all KV tensors and the continuous current input embedding.
-It writes keys in the native cache representation, after RoPE when used. These
-states need not correspond to any discrete token history. One representative root
-length fixes the encoder's output shape; advancing grows the cache until the
-next compression replaces it. Neither prediction nor decoding uses a stored
-position coordinate.
+For the supplied adapter, state includes past KV entries, a current token, and
+explicit position metadata. With a length-16 history, the past cache has 15
+ordinary-token positions, plus a BOS entry when BOS is visible. The encoder
+writes every KV entry with the same affine map, including the BOS entry, and
+leaves only structural position metadata fixed. It writes
+post-position-encoding keys directly and uses a continuous token vector, so
+written states need not correspond to any discrete token history. The fitted
+encoder uses one root length; advancing increases the length until the next
+compression resets it to that representative length. Context limits still apply.
 
 Pass `initializer=ghmm` to reuse a `GHMM`, or a callable mapping integer
 histories to initial coordinates, to bypass spectral fitting. A GHMM's first,
@@ -484,7 +407,7 @@ zero GHMM normalizers raise errors.
 
 Tests compare cached and native transformer predictions, parallel and
 sequential continuation gradients, attention measurements, BOS and position
-handling, full-cache/embedding writers, checkpoint matching, and spectral recovery
+handling, affine-writer constraints, checkpoint matching, and spectral recovery
 of an analytic three-symbol process. An end-to-end fit checks default GHMM
 initialization, split isolation, artifact reload, and frozen-decoder refinement.
 Additional tests check learned-query updates, prefix-length coverage, bounded
@@ -495,8 +418,9 @@ check that invalid numeric settings fail before data preparation.
 Exact enumeration also checks the sequence-KL chain rule for repeated
 compression. CI runs the suite on Python 3.10 and 3.12.
 
-Natural states and interventions both run through the same unmodified Hugging
-Face model. Conversion tests compare against a small independent reference
-implementation kept only in the test suite. The demo uses the MRRXOR process
-from [belief-state](https://github.com/artemyk/belief-state). This package contains
-fitting and conversion code, not the earlier experiment directories or results.
+Native and cached execution share the teacher's attention projection, and
+natural states are built using the same cache execution as interventions.
+The included checkpoint architecture follows
+[belief-state](https://github.com/artemyk/belief-state); the demo uses its MRRXOR
+process. Both repositories are available under the MIT license. This package
+contains fitting code, not the earlier experiment directories or their results.
